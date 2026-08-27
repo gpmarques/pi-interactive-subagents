@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -1206,13 +1206,25 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  it("getToolExtensionPath maps available custom tools and skips built-ins", () => {
+    withTempDir((dir) => {
+      const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+      const webSearchDir = join(dir, "extensions", "web-search");
+      mkdirSync(webSearchDir, { recursive: true });
+      writeFileSync(join(webSearchDir, "index.ts"), "export default () => {};\n");
+      process.env.PI_CODING_AGENT_DIR = dir;
+
+      try {
+        assert.equal(testApi.getToolExtensionPath("read"), undefined);
+        assert.equal(testApi.getToolExtensionPath("bash"), undefined);
+        assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+        assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+        // Spawning tools are registered by this extension itself.
+        assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousConfigDir);
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
