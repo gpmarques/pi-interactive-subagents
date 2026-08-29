@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
@@ -12,9 +13,13 @@ import {
   getNewEntries,
   countSessionEntryLines,
   getSessionId,
+  activateReservedNameRun,
+  claimCompletedNameRun,
+  markNameRunCompleted,
   readNameRegistry,
   readSubagentLoadout,
-  registerName,
+  removeOwnedNameRun,
+  reserveNameRun,
   resolveNameInRegistry,
   nameRegistryPath,
   writeSubagentLoadout,
@@ -30,7 +35,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { pollForExit, shellEscape } from "../pi-extension/subagents/mux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +61,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/mux.ts";
 
 // --- Helpers ---
 
@@ -77,6 +82,30 @@ function withTempDir(run: (dir: string) => void) {
     run(dir);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function seedRegistryRun(
+  artifactDir: string,
+  name: string,
+  entry: {
+    sessionFile: string;
+    sessionId: string | null;
+    runState?: "running" | "completed";
+    runId?: string;
+  },
+): void {
+  const runId = entry.runId ?? `fixture-${name}`;
+  assert.equal(reserveNameRun(artifactDir, name, runId), name);
+  assert.equal(
+    activateReservedNameRun(artifactDir, name, runId, {
+      sessionFile: entry.sessionFile,
+      sessionId: entry.sessionId,
+    }),
+    true,
+  );
+  if ((entry.runState ?? "completed") === "completed") {
+    assert.equal(markNameRunCompleted(artifactDir, entry.sessionFile, runId), true);
   }
 }
 
@@ -327,6 +356,7 @@ describe("session.ts", () => {
     const sample: SubagentLoadout = {
       agent: "worker",
       toolAllowlist: "read,write,edit,safe_bash,web_search,subagent,ask_question",
+      toolExtensions: ["/extensions/safe-bash.ts", "/extensions/web-search.ts"],
       model: "openrouter/z-ai/glm-5.2",
       thinking: "medium",
       systemPromptMode: "append",
@@ -359,26 +389,365 @@ describe("session.ts", () => {
       writeFileSync(sf + ".loadout.json", "not json{", "utf8");
       assert.equal(readSubagentLoadout(sf), null);
     });
+
+    it("refuses missing, malformed, and empty tool allowlists", () => {
+      const invalid = [
+        { ...sample, toolAllowlist: 42 },
+        { ...sample, toolAllowlist: [] },
+        { ...sample, toolAllowlist: "" },
+        { ...sample, toolAllowlist: " ,  , " },
+        { ...sample, toolAllowlist: "read,,write" },
+      ];
+      invalid.forEach((value, index) => {
+        const sf = join(dir, `invalid-loadout-${index}.jsonl`);
+        writeFileSync(loadoutSidecarPath(sf), JSON.stringify(value), "utf8");
+        assert.equal(readSubagentLoadout(sf), null);
+      });
+    });
+
+    it("refuses incomplete legacy null-allowlist snapshots", () => {
+      const unrestricted = {
+        ...sample,
+        toolAllowlist: null,
+        toolExtensions: null,
+        spawnable: null,
+      };
+      for (const field of Object.keys(unrestricted).filter((field) => field !== "toolExtensions")) {
+        const incomplete: Record<string, unknown> = { ...unrestricted };
+        delete incomplete[field];
+        const sf = join(dir, `incomplete-legacy-${field}.jsonl`);
+        writeFileSync(loadoutSidecarPath(sf), JSON.stringify(incomplete), "utf8");
+        assert.equal(readSubagentLoadout(sf), null, `missing ${field}`);
+      }
+    });
+
+    it("refuses missing and malformed required loadout fields", () => {
+      for (const field of Object.keys(sample)) {
+        const incomplete: Record<string, unknown> = { ...sample };
+        delete incomplete[field];
+        const sf = join(dir, `missing-${field}.jsonl`);
+        writeFileSync(loadoutSidecarPath(sf), JSON.stringify(incomplete), "utf8");
+        assert.equal(readSubagentLoadout(sf), null, `missing ${field}`);
+      }
+
+      const malformed = [
+        { ...sample, agent: 42 },
+        { ...sample, model: false },
+        { ...sample, thinking: [] },
+        { ...sample, systemPromptMode: "merge" },
+        { ...sample, identity: {} },
+        { ...sample, autoExit: "true" },
+        { ...sample, cwd: 42 },
+        { ...sample, model: "" },
+        { ...sample, cwd: "  " },
+        { ...sample, identity: "worker", systemPromptMode: null },
+        { ...sample, agentDir: [] },
+        { ...sample, toolExtensions: null },
+        { ...sample, toolExtensions: ["relative-extension.ts"] },
+        { ...sample, toolExtensions: ["/extension.ts", "/extension.ts"] },
+      ];
+      malformed.forEach((value, index) => {
+        const sf = join(dir, `malformed-field-${index}.jsonl`);
+        writeFileSync(loadoutSidecarPath(sf), JSON.stringify(value), "utf8");
+        assert.equal(readSubagentLoadout(sf), null);
+      });
+    });
+
+    it("refuses invalid spawnable values and arrays", () => {
+      const invalidSpawnable = [[], [""], ["scout", 42], ["scout,researcher"], "scout", {}];
+      invalidSpawnable.forEach((spawnable, index) => {
+        const sf = join(dir, `invalid-spawnable-${index}.jsonl`);
+        writeFileSync(
+          loadoutSidecarPath(sf),
+          JSON.stringify({ ...sample, spawnable }),
+          "utf8",
+        );
+        assert.equal(readSubagentLoadout(sf), null);
+      });
+    });
+
+    it("preserves an explicit legacy null allowlist as intentionally unrestricted", () => {
+      const sf = join(dir, "legacy-unrestricted.jsonl");
+      const unrestricted = { ...sample, toolAllowlist: null, spawnable: null };
+      delete (unrestricted as Partial<SubagentLoadout>).toolExtensions;
+      writeFileSync(loadoutSidecarPath(sf), JSON.stringify(unrestricted), "utf8");
+      assert.deepEqual(readSubagentLoadout(sf), { ...unrestricted, toolExtensions: null });
+    });
+
+    it("strips lifecycle tools unless spawnable is a valid non-empty string array", () => {
+      const lifecycle = "read,subagent,subagent_message,subagent_resume,subagent_kill,subagents_list,write";
+      const stale = join(dir, "stale-lifecycle.jsonl");
+      writeFileSync(
+        loadoutSidecarPath(stale),
+        JSON.stringify({
+          ...sample,
+          toolAllowlist: lifecycle,
+          toolExtensions: [],
+          spawnable: null,
+        }),
+        "utf8",
+      );
+      const restricted = readSubagentLoadout(stale);
+      assert.ok(restricted);
+      assert.equal(restricted.toolAllowlist, "read,write");
+      assert.equal(restricted.spawnable, null);
+
+      const sf = join(dir, "valid-lifecycle.jsonl");
+      writeFileSync(
+        loadoutSidecarPath(sf),
+        JSON.stringify({
+          ...sample,
+          toolAllowlist: lifecycle,
+          toolExtensions: ["/extensions/subagents.ts"],
+          spawnable: [" scout ", "researcher"],
+        }),
+        "utf8",
+      );
+      const loaded = readSubagentLoadout(sf);
+      assert.ok(loaded);
+      assert.equal(loaded.toolAllowlist, lifecycle);
+      assert.deepEqual(loaded.spawnable, ["scout", "researcher"]);
+    });
   });
 
   describe("subagent name registry", () => {
-    it("registers and resolves a name to its session file", () => {
+    it("activates and resolves a name to its session file", () => {
       const adir = join(dir, "art-1");
-      registerName(adir, "worker", { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
+      seedRegistryRun(adir, "worker", {
+        sessionFile: "/s/worker.jsonl",
+        sessionId: "id-worker",
+      });
       const entry = resolveNameInRegistry(adir, "worker");
-      assert.deepEqual(entry, { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
+      assert.deepEqual(entry, {
+        sessionFile: "/s/worker.jsonl",
+        sessionId: "id-worker",
+        runState: "completed",
+        runId: "fixture-worker",
+      });
       assert.ok(existsSync(nameRegistryPath(adir)));
     });
 
-    it("accumulates multiple names and overwrites on re-register", () => {
+    it("accumulates names without overwriting an existing owner", () => {
       const adir = join(dir, "art-2");
-      registerName(adir, "scout", { sessionFile: "/s/scout.jsonl", sessionId: "id-scout" });
-      registerName(adir, "scout-2", { sessionFile: "/s/scout2.jsonl", sessionId: "id-scout2" });
+      seedRegistryRun(adir, "scout", {
+        sessionFile: "/s/scout.jsonl",
+        sessionId: "id-scout",
+      });
+      seedRegistryRun(adir, "scout-2", {
+        sessionFile: "/s/scout2.jsonl",
+        sessionId: "id-scout2",
+      });
       const reg = readNameRegistry(adir);
       assert.deepEqual(Object.keys(reg).sort(), ["scout", "scout-2"]);
-      // Overwrite scout with a new session file.
-      registerName(adir, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" });
-      assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout-new.jsonl");
+
+      const next = reserveNameRun(adir, "scout", "third-owner");
+      assert.equal(next, "scout-3");
+      assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout.jsonl");
+      assert.equal(removeOwnedNameRun(adir, next, "", "third-owner", "pending"), true);
+    });
+
+    it("waits for ownerless cross-process contention without reaping the live lock", async () => {
+      const adir = join(dir, "art-lock-contention");
+      mkdirSync(adir, { recursive: true });
+      const lockPath = `${nameRegistryPath(adir)}.lock`;
+      writeFileSync(lockPath, "owner-metadata-not-yet-written", "utf8");
+      const remover = spawn(process.execPath, [
+        "-e",
+        `setTimeout(() => require("node:fs").unlinkSync(${JSON.stringify(lockPath)}), 350)`,
+      ]);
+      const removerExit = new Promise<number | null>((resolve) => {
+        remover.once("exit", (code) => resolve(code));
+      });
+
+      assert.equal(reserveNameRun(adir, "worker", "run-1"), "worker");
+
+      assert.equal(await removerExit, 0, "the original holder must release its own lock");
+      assert.equal(resolveNameInRegistry(adir, "worker")?.runId, "run-1");
+    });
+
+    it("atomically reserves distinct names across parent processes without overwriting owners", async () => {
+      const adir = join(dir, "art-cross-process-reservations");
+      const barrier = join(dir, "release-reservations");
+      const workerCount = 8;
+      const sessionModuleUrl = new URL(
+        "../pi-extension/subagents/session.ts",
+        import.meta.url,
+      ).href;
+      const workers = Array.from({ length: workerCount }, (_, index) => {
+        const owner = `owner-${index}`;
+        const ready = join(dir, `ready-${index}`);
+        const script = [
+          `import { existsSync, writeFileSync } from "node:fs";`,
+          `import * as registry from ${JSON.stringify(sessionModuleUrl)};`,
+          `writeFileSync(${JSON.stringify(ready)}, "ready");`,
+          `while (!existsSync(${JSON.stringify(barrier)})) await new Promise((resolve) => setTimeout(resolve, 5));`,
+          `const name = registry.reserveNameRun(${JSON.stringify(adir)}, "Worker", ${JSON.stringify(owner)});`,
+          `console.log(JSON.stringify({ name, owner: ${JSON.stringify(owner)} }));`,
+        ].join("\n");
+        const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => { stdout += chunk; });
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        return {
+          ready,
+          result: new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+            child.once("exit", (code) => resolve({ code, stdout, stderr }));
+          }),
+        };
+      });
+
+      const readyDeadline = Date.now() + 5_000;
+      while (workers.some((worker) => !existsSync(worker.ready)) && Date.now() < readyDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(
+        workers.every((worker) => existsSync(worker.ready)),
+        true,
+        "all child processes must reach the same registry barrier",
+      );
+      writeFileSync(barrier, "go");
+
+      const results = await Promise.all(workers.map((worker) => worker.result));
+      for (const result of results) {
+        assert.equal(result.code, 0, result.stderr);
+      }
+      const reservations = results.map((result) => JSON.parse(result.stdout.trim()) as {
+        name: string;
+        owner: string;
+      });
+      assert.equal(new Set(reservations.map(({ name }) => name)).size, workerCount);
+      assert.deepEqual(
+        reservations.map(({ name }) => name).sort(),
+        ["Worker", ...Array.from({ length: workerCount - 1 }, (_, index) => `Worker-${index + 2}`)].sort(),
+      );
+
+      const registry = readNameRegistry(adir);
+      for (const { name, owner } of reservations) {
+        assert.equal(registry[name]?.runState, "pending");
+        assert.equal(registry[name]?.runId, owner, `${name} must retain its reserving owner`);
+      }
+    });
+
+    it("activates and removes only the exact reservation owner", async () => {
+      const registryApi = await import("../pi-extension/subagents/session.ts") as any;
+      const adir = join(dir, "art-owned-reservation");
+      const name = registryApi.reserveNameRun(adir, "Worker", "owner-a");
+
+      assert.equal(
+        registryApi.activateReservedNameRun(adir, name, "owner-b", {
+          sessionFile: "/sessions/wrong.jsonl",
+          sessionId: "wrong",
+        }),
+        false,
+      );
+      assert.equal(resolveNameInRegistry(adir, name)?.runState, "pending");
+      assert.equal(resolveNameInRegistry(adir, name)?.runId, "owner-a");
+
+      assert.equal(
+        registryApi.activateReservedNameRun(adir, name, "owner-a", {
+          sessionFile: "/sessions/owned.jsonl",
+          sessionId: "owned",
+        }),
+        true,
+      );
+      assert.equal(resolveNameInRegistry(adir, name)?.runState, "running");
+      assert.equal(
+        registryApi.removeOwnedNameRun(adir, name, "/sessions/owned.jsonl", "owner-b", "running"),
+        false,
+      );
+      assert.equal(resolveNameInRegistry(adir, name)?.runId, "owner-a");
+      assert.equal(
+        registryApi.removeOwnedNameRun(adir, name, "/sessions/owned.jsonl", "owner-a", "running"),
+        true,
+      );
+      assert.equal(resolveNameInRegistry(adir, name), null);
+    });
+
+    it("atomically claims completed session aliases and requires the owning run to complete them", () => {
+      const adir = join(dir, "art-run-state");
+      const sessionFile = "/s/shared.jsonl";
+      for (const name of ["worker", "worker-alias"]) {
+        seedRegistryRun(adir, name, {
+          sessionFile,
+          sessionId: "shared",
+          runId: `old-run-${name}`,
+        });
+      }
+
+      assert.deepEqual(claimCompletedNameRun(adir, "worker", sessionFile, "new-run"), { ok: true });
+      assert.equal(resolveNameInRegistry(adir, "worker")?.runState, "running");
+      assert.equal(resolveNameInRegistry(adir, "worker-alias")?.runId, "new-run");
+      assert.deepEqual(
+        claimCompletedNameRun(adir, "worker-alias", sessionFile, "other-run"),
+        { ok: false, reason: "not-completed", conflictingName: "worker-alias" },
+      );
+      assert.equal(markNameRunCompleted(adir, sessionFile, "other-run"), false);
+      assert.equal(markNameRunCompleted(adir, sessionFile, "new-run"), true);
+      assert.equal(resolveNameInRegistry(adir, "worker")?.runState, "completed");
+      assert.equal(resolveNameInRegistry(adir, "worker-alias")?.runState, "completed");
+    });
+
+    it("fails closed without writing when completed ownership has a missing or empty run id", () => {
+      for (const [label, malformedRunId] of [
+        ["missing", undefined],
+        ["empty", ""],
+      ] as const) {
+        const adir = join(dir, `art-malformed-owner-${label}`);
+        mkdirSync(adir, { recursive: true });
+        const entry: Record<string, unknown> = {
+          sessionFile: "/s/malformed-owner.jsonl",
+          sessionId: "malformed-owner",
+          runState: "completed",
+        };
+        if (malformedRunId !== undefined) entry.runId = malformedRunId;
+        writeFileSync(nameRegistryPath(adir), JSON.stringify({ Worker: entry }));
+        const before = readFileSync(nameRegistryPath(adir), "utf8");
+
+        const result = claimCompletedNameRun(
+          adir,
+          "Worker",
+          "/s/malformed-owner.jsonl",
+          "new-owner",
+        );
+
+        assert.equal(result.ok, false, `${label} runId must not be claimed`);
+        assert.equal(readFileSync(nameRegistryPath(adir), "utf8"), before);
+      }
+    });
+
+    it("fails closed without writing when any same-session alias is malformed", () => {
+      const adir = join(dir, "art-malformed-alias");
+      mkdirSync(adir, { recursive: true });
+      const sessionFile = "/s/shared-malformed-alias.jsonl";
+      writeFileSync(nameRegistryPath(adir), JSON.stringify({
+        Worker: {
+          sessionFile,
+          sessionId: "shared",
+          runState: "completed",
+          runId: "old-worker",
+        },
+        "Worker-alias": {
+          sessionFile,
+          sessionId: "",
+          runState: "completed",
+          runId: "old-alias",
+        },
+      }));
+      const before = readFileSync(nameRegistryPath(adir), "utf8");
+
+      const result = claimCompletedNameRun(adir, "Worker", sessionFile, "new-owner");
+
+      assert.equal(result.ok, false);
+      assert.equal(readFileSync(nameRegistryPath(adir), "utf8"), before);
+    });
+
+    it("does not export path-only registry mutation helpers", async () => {
+      const registryApi = await import("../pi-extension/subagents/session.ts") as Record<string, unknown>;
+      assert.equal("registerName" in registryApi, false);
+      assert.equal("removeNameIfSession" in registryApi, false);
     });
 
     it("returns null for unknown names and {} for a missing/corrupt registry", () => {
@@ -1184,6 +1553,74 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("bundled reviewer is read-only, autonomous, and cannot use lifecycle tools", async () => {
+    await withIsolatedAgentEnv(() => {
+      const reviewer = testApi.loadAgentDefaults("reviewer");
+      assert.ok(reviewer, "expected bundled reviewer to be discoverable");
+      assert.deepEqual(reviewer.tools?.split(",").map((tool: string) => tool.trim()), ["read", "bash"]);
+      assert.equal(reviewer.model, "openai-codex/gpt-5.6-sol");
+      assert.equal(reviewer.thinking, "high");
+      assert.equal(reviewer.systemPromptMode, "append");
+      assert.equal(reviewer.autoExit, true);
+      assert.equal(
+        testApi.resolveEffectiveInteractive({ name: "reviewer", task: "" }, reviewer),
+        false,
+      );
+      assert.equal(reviewer.subagentAgents, undefined);
+
+      const allowlist = new Set(
+        testApi.buildSubagentToolAllowlist(reviewer.tools, { grantSpawning: false })!.split(","),
+      );
+      for (const tool of [
+        "subagent",
+        "subagent_message",
+        "subagent_resume",
+        "subagent_kill",
+        "subagents_list",
+      ]) {
+        assert.equal(allowlist.has(tool), false, `reviewer must not receive lifecycle tool ${tool}`);
+      }
+    });
+  });
+
+  it("bundled planner is interactive, constrained, and granted lifecycle tools through its spawn gate", async () => {
+    await withIsolatedAgentEnv(() => {
+      const planner = testApi.loadAgentDefaults("planner");
+      assert.ok(planner, "expected bundled planner to be discoverable");
+      assert.deepEqual(planner.tools?.split(",").map((tool: string) => tool.trim()), [
+        "read",
+        "write",
+        "bash",
+      ]);
+      assert.equal(planner.model, "openai-codex/gpt-5.6-sol");
+      assert.equal(planner.thinking, "high");
+      assert.equal(planner.systemPromptMode, "append");
+      assert.equal(planner.interactive, true);
+      assert.equal(planner.autoExit, false);
+      assert.equal(
+        testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
+        true,
+      );
+      assert.deepEqual(planner.subagentAgents, ["scout", "researcher"]);
+
+      const allowlist = new Set(
+        testApi.buildSubagentToolAllowlist(planner.tools, {
+          grantSpawning: !!planner.subagentAgents?.length,
+        })!.split(","),
+      );
+      for (const tool of [
+        "subagent",
+        "subagent_message",
+        "subagent_resume",
+        "subagent_kill",
+        "subagents_list",
+      ]) {
+        assert.equal(allowlist.has(tool), true, `planner should receive lifecycle tool ${tool}`);
+      }
+      assert.equal(allowlist.has("edit"), false, "planner must not receive the edit tool");
+    });
+  });
+
   it("worker is granted the spawning toolset restricted to scout and researcher", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
@@ -1192,7 +1629,7 @@ describe("subagent discovery", () => {
     const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
     assert.ok(allowlist, "expected an allowlist");
     const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
+    for (const t of ["subagent", "subagent_message", "subagent_resume", "subagent_kill", "subagents_list"]) {
       assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
     }
     assert.ok(tools.has("bash"), "expected worker to keep bash");
@@ -1221,6 +1658,8 @@ describe("subagent discovery", () => {
         assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
         // Spawning tools are registered by this extension itself.
         assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+        assert.ok(testApi.getToolExtensionPath("subagent_resume")?.endsWith("index.ts"));
+        assert.ok(testApi.getToolExtensionPath("subagent_kill")?.endsWith("index.ts"));
       } finally {
         restoreEnvVar("PI_CODING_AGENT_DIR", previousConfigDir);
       }
@@ -1291,9 +1730,125 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-    assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
-    assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  it("defaults an unconfigured named profile to the child control tool", () => {
+    assert.equal(testApi.buildSubagentToolAllowlist(undefined), "ask_question");
+    assert.equal(testApi.buildSubagentToolAllowlist(""), "ask_question");
+  });
+
+  it("does not let explicit tools bypass the nested-spawn gate", () => {
+    const allowlist = testApi.buildSubagentToolAllowlist(
+      "read,subagent,subagent_kill,subagents_list",
+      { grantSpawning: false },
+    );
+    assert.equal(allowlist, "read,ask_question");
+  });
+
+  it("maps supported Pi profile tools to a strict Claude built-in policy", () => {
+    assert.deepEqual(
+      testApi.resolveClaudeToolPolicy(
+        "read,write,edit,bash,grep,find,web_search,web_fetch",
+        undefined,
+      ),
+      { tools: ["Read", "Write", "Edit", "Bash", "Grep", "Glob", "WebSearch", "WebFetch"] },
+    );
+    assert.deepEqual(testApi.resolveClaudeToolPolicy(undefined, undefined), { tools: [] });
+  });
+
+  it("refuses Claude profiles whose requested restrictions cannot be honored", () => {
+    assert.match(testApi.resolveClaudeToolPolicy("read,safe_bash", undefined).error, /safe_bash/);
+    assert.match(testApi.resolveClaudeToolPolicy("read,ls", undefined).error, /ls/);
+    assert.match(
+      testApi.resolveClaudeToolPolicy("read", ["scout"]).error,
+      /nested subagents|subagent_agents/i,
+    );
+  });
+
+  it("requires installed Claude help to advertise every fail-closed policy flag", () => {
+    const supported = [
+      "--tools <tools...>",
+      "--allowedTools, --allowed-tools <tools...>",
+      "--permission-mode <mode> (choices: dontAsk)",
+      "--setting-sources <sources>",
+      "--mcp-config <configs...>",
+      "--strict-mcp-config",
+    ].join("\n");
+    assert.equal(testApi.claudePolicyHelpError(supported), null);
+    assert.match(testApi.claudePolicyHelpError(supported.replace("--strict-mcp-config", "")), /strict-mcp/);
+  });
+
+  it("builds Claude launches without bypass permissions or ambient MCP/settings", () => {
+    const parts = ["claude"];
+    testApi.applyClaudeToolPolicy(parts, ["Read", "Grep"]);
+    const joined = parts.join(" ");
+    assert.match(joined, /--tools 'Read,Grep'/);
+    assert.match(joined, /--allowedTools 'Read,Grep'/);
+    assert.match(joined, /--permission-mode dontAsk/);
+    assert.match(joined, /--setting-sources ''/);
+    assert.match(joined, /--strict-mcp-config/);
+    assert.match(joined, /--mcp-config/);
+    assert.doesNotMatch(joined, /dangerously-skip-permissions|bypassPermissions/);
+
+    const noTools = ["claude"];
+    testApi.applyClaudeToolPolicy(noTools, []);
+    assert.match(noTools.join(" "), /--tools ''/);
+    assert.equal(noTools.includes("--allowedTools"), false);
+  });
+
+  it("keeps a stale lifecycle-only resume loadout restricted without loading this extension", () => {
+    withTempDir((d) => {
+      const sessionFile = join(d, "stale.jsonl");
+      writeFileSync(
+        loadoutSidecarPath(sessionFile),
+        JSON.stringify({
+          agent: "worker",
+          toolAllowlist: "subagent,subagent_message,subagent_resume,subagent_kill,subagents_list",
+          toolExtensions: [],
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        }),
+      );
+      const loaded = readSubagentLoadout(sessionFile);
+      assert.ok(loaded);
+      assert.equal(loaded.toolAllowlist, "");
+
+      const parts: string[] = [];
+      testApi.applySandboxToParts(parts, loaded, { artifactDir: d, name: "worker" });
+      assert.ok(parts.includes("--no-extensions"));
+      assert.ok(parts.includes("--tools"));
+      assert.equal(parts.some((part) => part.includes("index.ts")), false);
+    });
+  });
+
+  it("applies default-deny flags for a named profile that omits tools", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "custom",
+          toolAllowlist: testApi.buildSubagentToolAllowlist(undefined),
+          toolExtensions: [],
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: d, name: "custom" },
+      );
+      assert.ok(parts.includes("--no-extensions"));
+      assert.ok(parts.includes("--tools"));
+      assert.ok(parts.some((part) => part.includes("ask_question")));
+    });
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
@@ -1304,6 +1859,7 @@ describe("subagent discovery", () => {
         {
           agent: "worker",
           toolAllowlist: "read,write,safe_bash",
+          toolExtensions: [],
           model: "openrouter/z-ai/glm-5.2",
           thinking: "medium",
           systemPromptMode: "append",
@@ -1341,6 +1897,7 @@ describe("subagent discovery", () => {
         {
           agent: null,
           toolAllowlist: null,
+          toolExtensions: null,
           model: null,
           thinking: null,
           systemPromptMode: null,
@@ -1756,12 +2313,10 @@ describe("subagent-done.ts", () => {
 describe("tmux.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
-  it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
-    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
-    // unknown `type: "ping"` payload now falls through to a clean done.
-    assert.deepEqual(
+  it("rejects ping payloads because ask_question keeps the session open", () => {
+    assert.equal(
       interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      { reason: "done", exitCode: 0 },
+      null,
     );
   });
 
@@ -1794,11 +2349,248 @@ describe("tmux.ts interpretExitSidecar", () => {
     assert.match(result.errorMessage ?? "", /no errorMessage/);
   });
 
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  it("rejects null, empty, and unknown terminal payloads", () => {
+    assert.equal(interpretExitSidecar({}), null);
+    assert.equal(interpretExitSidecar(null), null);
+    assert.equal(interpretExitSidecar({ type: "future-terminal" }), null);
+    assert.equal(interpretExitSidecar("malformed-shape"), null);
   });
 });
+
+describe("tmux.ts missing-pane polling", () => {
+  const missingPaneError = () => Object.assign(
+    new Error("tmux capture-pane failed: can't find pane: %42"),
+    { stderr: JSON.stringify({ error: { code: "pane_not_found" } }) },
+  );
+
+  it("terminates after a missing pane is confirmed", async () => {
+    let reads = 0;
+    const result = await pollForExit("%42", new AbortController().signal, {
+      interval: 1,
+      readScreen: async () => {
+        reads++;
+        throw missingPaneError();
+      },
+    });
+
+    assert.deepEqual(result, { reason: "disappeared", exitCode: 1 });
+    assert.equal(reads, 2, "one failed capture plus one confirmation is sufficient");
+  });
+
+  it("recovers when a missing-pane capture succeeds on confirmation", async () => {
+    let reads = 0;
+    const result = await pollForExit("%42", new AbortController().signal, {
+      interval: 1,
+      readScreen: async () => {
+        reads++;
+        if (reads === 1) throw missingPaneError();
+        if (reads === 2) return "";
+        return "__SUBAGENT_DONE_0__";
+      },
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.equal(reads, 3);
+  });
+
+  it("ignores an unknown sidecar and continues to a real terminal sentinel", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "unknown-sidecar.jsonl");
+    let reads = 0;
+    try {
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "ping" }));
+      const result = await pollForExit("%42", new AbortController().signal, {
+        interval: 1,
+        sessionFile,
+        readScreen: async () => {
+          reads++;
+          return "__SUBAGENT_DONE_7__";
+        },
+      });
+
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 7 });
+      assert.equal(reads, 1, "unknown sidecars must not terminate polling");
+      assert.equal(existsSync(`${sessionFile}.exit`), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let malformed sidecar JSON block a real terminal sentinel", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "malformed-sidecar.jsonl");
+    try {
+      writeFileSync(`${sessionFile}.exit`, "{not-json");
+      const result = await pollForExit("%42", new AbortController().signal, {
+        interval: 1,
+        sessionFile,
+        readScreen: async () => "__SUBAGENT_DONE_3__",
+      });
+
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 3 });
+      assert.equal(
+        existsSync(`${sessionFile}.exit`),
+        true,
+        "malformed payloads are not consumed or promoted to completion",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not classify a generic transient tmux error as disappearance", async () => {
+    let reads = 0;
+    const result = await pollForExit("%42", new AbortController().signal, {
+      interval: 1,
+      readScreen: async () => {
+        reads++;
+        if (reads === 1) throw new Error("tmux server temporarily unavailable");
+        return "__SUBAGENT_DONE_0__";
+      },
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.equal(reads, 2);
+  });
+
+  it("prefers an error sidecar racing with pane disappearance", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "raced.jsonl");
+    let reads = 0;
+    try {
+      const result = await pollForExit("%42", new AbortController().signal, {
+        interval: 1,
+        sessionFile,
+        readScreen: async () => {
+          reads++;
+          writeFileSync(
+            `${sessionFile}.exit`,
+            JSON.stringify({ type: "error", errorMessage: "provider exhausted retries" }),
+          );
+          throw missingPaneError();
+        },
+      });
+
+      assert.equal(result.reason, "error");
+      assert.equal(result.exitCode, 1);
+      assert.equal(result.errorMessage, "provider exhausted retries");
+      assert.equal(reads, 1);
+      assert.equal(existsSync(`${sessionFile}.exit`), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("integration harness owned child cleanup", () => {
+  it("collects only exact owned outer-session children and preserves unknown files", async () => {
+    const harness = await import("./integration/harness.ts") as any;
+    const dir = createTestDir();
+    try {
+      const ownedOuter = join(dir, "owned-outer.jsonl");
+      const unownedOuter = join(dir, "unowned-outer.jsonl");
+      const ownedDir = join(dir, "owned-child-dir");
+      const unownedDir = join(dir, "unowned-child-dir");
+      const ownedChild = join(ownedDir, "owned.jsonl");
+      const unownedChild = join(unownedDir, "unowned.jsonl");
+      mkdirSync(ownedDir, { recursive: true });
+      mkdirSync(unownedDir, { recursive: true });
+      for (const path of [ownedChild, `${ownedChild}.loadout.json`, `${ownedChild}.ask`, `${ownedChild}.exit`]) {
+        writeFileSync(path, "owned");
+      }
+      const unknownFile = join(ownedDir, "keep.me");
+      writeFileSync(unknownFile, "unknown");
+      writeFileSync(unownedChild, "unowned");
+      const outerEntry = (sessionFile: string) => JSON.stringify({
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          details: { status: "started", sessionFile },
+          content: [],
+        },
+      }) + "\n";
+      writeFileSync(ownedOuter, outerEntry(ownedChild));
+      writeFileSync(unownedOuter, outerEntry(unownedChild));
+
+      const collected = harness.collectOwnedChildSessionFiles([ownedOuter]);
+      assert.deepEqual(collected.sessionFiles, [ownedChild]);
+      assert.deepEqual(collected.errors, []);
+      harness.cleanupOwnedChildSessionFiles(collected.sessionFiles);
+
+      assert.equal(existsSync(ownedChild), false);
+      assert.equal(existsSync(`${ownedChild}.loadout.json`), false);
+      assert.equal(existsSync(`${ownedChild}.ask`), false);
+      assert.equal(existsSync(`${ownedChild}.exit`), false);
+      assert.equal(existsSync(unknownFile), true, "unknown files must prevent exact-dir removal");
+      assert.equal(existsSync(ownedDir), true);
+      assert.equal(existsSync(unownedChild), true, "unowned outer sessions must never be scanned");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports malformed and unreadable owned transcripts while preserving discovered cleanup", async () => {
+    const harness = await import("./integration/harness.ts") as any;
+    const dir = createTestDir();
+    try {
+      const validOuter = join(dir, "valid-outer.jsonl");
+      const malformedOuter = join(dir, "malformed-outer.jsonl");
+      const missingOuter = join(dir, "missing-outer.jsonl");
+      const child = join(dir, "child.jsonl");
+      const unknown = join(dir, "unknown.jsonl");
+      writeFileSync(child, "owned");
+      writeFileSync(unknown, "unknown");
+      writeFileSync(validOuter, JSON.stringify({
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          details: { status: "started", sessionFile: child },
+        },
+      }) + "\n");
+      writeFileSync(malformedOuter, "{not-json}\n");
+
+      const collected = harness.collectOwnedChildSessionFiles([
+        validOuter,
+        malformedOuter,
+        missingOuter,
+      ]);
+      assert.deepEqual(collected.sessionFiles, [child]);
+      assert.equal(collected.errors.length, 2);
+      assert.match(collected.errors[0].message, /malformed/i);
+      assert.match(collected.errors[1].message, /read/i);
+
+      harness.cleanupOwnedChildSessionFiles(collected.sessionFiles);
+      assert.equal(existsSync(child), false, "valid discoveries are still cleaned");
+      assert.equal(existsSync(unknown), true, "unknown files remain untouched");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("aggregates exact-file cleanup failures after attempting the remaining owned files", async () => {
+    const harness = await import("./integration/harness.ts") as any;
+    const dir = createTestDir();
+    try {
+      const child = join(dir, "child.jsonl");
+      writeFileSync(child, "owned");
+      mkdirSync(`${child}.ask`);
+      writeFileSync(`${child}.loadout.json`, "owned");
+
+      assert.throws(
+        () => harness.cleanupOwnedChildSessionFiles([child]),
+        (error: any) => error instanceof AggregateError && error.errors.length === 1,
+      );
+      assert.equal(existsSync(child), false);
+      assert.equal(existsSync(`${child}.loadout.json`), false);
+      assert.equal(existsSync(`${child}.ask`), true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("commands", () => {
   it("/subagent emits a spawn tool call for a known agent", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
@@ -1933,12 +2725,43 @@ describe("tool registration", () => {
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
-  it("no longer registers subagent_interrupt or subagent_resume", () => {
+  it("registers the completed-only safe resume and kill tools, but not interrupt", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_interrupt"), false);
-    assert.equal(names.includes("subagent_resume"), false);
+    assert.equal(names.includes("subagent_kill"), true);
+    assert.equal(names.includes("subagent_resume"), true);
+
+    const kill = registeredTools.find((tool) => tool.name === "subagent_kill");
+    assert.deepEqual(Object.keys(kill.parameters.properties), ["name"]);
+    assert.deepEqual(kill.parameters.required, ["name"]);
+
+    const lifecycleNames = [
+      "subagent", "subagent_message", "subagent_resume", "subagent_kill", "subagents_list",
+    ];
+    assert.equal(
+      lifecycleNames.filter((name) => names.includes(name)).length,
+      5,
+      "the parent system-prompt surface should contain five lifecycle tools",
+    );
+
+    const resume = registeredTools.find((tool) => tool.name === "subagent_resume");
+    assert.deepEqual(Object.keys(resume.parameters.properties).sort(), ["message", "name"]);
+    assert.deepEqual(resume.parameters.required?.slice().sort(), ["message", "name"]);
+    for (const forbidden of [
+      "sessionPath", "sessionId", "cwd", "model", "tools", "autoExit", "interactive",
+    ]) {
+      assert.equal(resume.parameters.properties[forbidden], undefined);
+    }
+    assert.match(resume.description, /current parent session|parent-scoped/i);
+    assert.match(resume.promptSnippet, /completed/i);
+    assert.match(resume.promptSnippet, /subagent_message.*live|live.*subagent_message/i);
+    assert.doesNotMatch(resume.promptSnippet, /session path|session id/i);
+
+    const message = registeredTools.find((tool) => tool.name === "subagent_message");
+    assert.match(message.promptSnippet, /backward compatibility/i);
+    assert.match(message.promptSnippet, /prefer subagent_resume/i);
   });
 });
 
@@ -2129,13 +2952,152 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_message and not the old interrupt/resume tools", () => {
+  it("registers subagent_message and explicit resume, but not the old interrupt tool", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_message"), true);
+    assert.equal(names.includes("subagent_resume"), true);
     assert.equal(names.includes("subagent_interrupt"), false);
-    assert.equal(names.includes("subagent_resume"), false);
+  });
+
+  it("kills Pi and Claude children through the lifecycle seam", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    withTempDir((dir) => {
+      for (const cli of [undefined, "claude"]) {
+        const sessionFile = join(dir, `${cli ?? "pi"}.jsonl`);
+        const registryDir = join(dir, `registry-${cli ?? "pi"}`);
+        writeFileSync(sessionFile, "{}\n");
+        const runId = `kill-${cli ?? "pi"}`;
+        seedRegistryRun(registryDir, "Worker", {
+          sessionFile,
+          sessionId: null,
+          runState: "running",
+          runId,
+        });
+        let aborted = false;
+        const running = {
+          id: runId,
+          name: "Worker",
+          task: "",
+          surface: `pane-${cli ?? "pi"}`,
+          startTime: 0,
+          sessionFile,
+          registryArtifactDir: registryDir,
+          cli,
+          abortController: { abort() { aborted = true; } },
+          interactive: false,
+          statusState: createStatusState({ source: cli === "claude" ? "claude" : "pi", startTimeMs: 0 }),
+        };
+        runningMap.set(running.id, running);
+        const result = testApi.handleSubagentKill({ name: "Worker" }, () => {});
+        assert.equal(result.details.status, "killed");
+        assert.equal(aborted, true);
+        assert.equal(runningMap.has(running.id), false);
+        assert.equal(testApi.shouldSuppressWatcherMessage(running), true);
+        assert.equal(resolveNameInRegistry(registryDir, "Worker"), null);
+        assert.equal(existsSync(sessionFile), true, "kill must preserve the transcript");
+        const replacement = join(dir, `${cli ?? "pi"}-replacement.jsonl`);
+        seedRegistryRun(registryDir, "Worker", { sessionFile: replacement, sessionId: null });
+        assert.equal(resolveNameInRegistry(registryDir, "Worker")?.sessionFile, replacement);
+      }
+    });
+    runningMap.clear();
+  });
+
+  it("does not delete a newer mapping when stale ownership performs cleanup", () => {
+    withTempDir((dir) => {
+      seedRegistryRun(dir, "Worker", {
+        sessionFile: "/old.jsonl",
+        sessionId: null,
+        runState: "running",
+        runId: "old-owner",
+      });
+      assert.equal(
+        removeOwnedNameRun(dir, "Worker", "/old.jsonl", "old-owner", "running"),
+        true,
+      );
+      seedRegistryRun(dir, "Worker", {
+        sessionFile: "/new.jsonl",
+        sessionId: null,
+        runState: "running",
+        runId: "new-owner",
+      });
+
+      assert.equal(
+        removeOwnedNameRun(dir, "Worker", "/old.jsonl", "old-owner", "running"),
+        false,
+      );
+      assert.equal(resolveNameInRegistry(dir, "Worker")?.sessionFile, "/new.jsonl");
+    });
+  });
+
+  it("reports unknown names and termination failures without claiming success", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    assert.match(testApi.handleSubagentKill({ name: "Ghost" }, () => {}).content[0].text, /No running/);
+
+    withTempDir((dir) => {
+      const completed = join(dir, "completed.jsonl");
+      writeFileSync(completed, "{}\n");
+      seedRegistryRun(dir, "Completed", { sessionFile: completed, sessionId: null });
+      // Kill addresses the live map only; a completed registry entry is not killable.
+      assert.match(testApi.handleSubagentKill({ name: "Completed" }, () => {}).content[0].text, /No running/);
+    });
+
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "worker.jsonl");
+      writeFileSync(sessionFile, "{}\n");
+      seedRegistryRun(dir, "Worker", {
+        sessionFile,
+        sessionId: null,
+        runState: "running",
+        runId: "failed-kill",
+      });
+      const running = {
+        id: "failed-kill", name: "Worker", task: "", surface: "pane", startTime: 0,
+        sessionFile, registryArtifactDir: dir, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      };
+      runningMap.set(running.id, running);
+      const result = testApi.handleSubagentKill({ name: "Worker" }, () => { throw new Error("kill-pane failed"); });
+      assert.match(result.content[0].text, /process may still be running/);
+      assert.equal(runningMap.has(running.id), true);
+      assert.ok(resolveNameInRegistry(dir, "Worker"));
+      runningMap.clear();
+    });
+  });
+
+  it("surfaces registry cleanup failures after terminating the process", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "worker.jsonl");
+      writeFileSync(sessionFile, "{}\n");
+      seedRegistryRun(dir, "Worker", {
+        sessionFile,
+        sessionId: null,
+        runState: "running",
+        runId: "registry-failure",
+      });
+      rmSync(nameRegistryPath(dir), { force: true });
+      mkdirSync(nameRegistryPath(dir));
+      const running = {
+        id: "registry-failure", name: "Worker", task: "", surface: "pane", startTime: 0,
+        sessionFile, registryArtifactDir: dir, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      };
+      runningMap.set(running.id, running);
+      const result = testApi.handleSubagentKill({ name: "Worker" }, () => {});
+      assert.match(result.content[0].text, /registry could not be cleaned up/);
+      assert.equal(runningMap.has(running.id), false);
+    });
+    runningMap.clear();
   });
 
   it("resolves a running subagent by exact name and reports ambiguity", () => {
@@ -2224,6 +3186,107 @@ describe("subagent interruption", () => {
       runningMap.clear();
       reserved.clear();
     }
+  });
+
+  it("deduplicates and reserves serial explicit names", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const reserved = testApi.reservedNames as Set<string>;
+    runningMap.clear();
+    reserved.clear();
+
+    withTempDir((dir) => {
+      try {
+        const first = testApi.reserveSpawnName("Reviewer", "scout", dir);
+        assert.equal(first.name, "Reviewer");
+        testApi.releaseSpawnName(first);
+        seedRegistryRun(dir, first.name, {
+          sessionFile: "/reviewer.jsonl",
+          sessionId: "first",
+          runState: "running",
+          runId: "first",
+        });
+        runningMap.set("first", makeRunning({ id: "first", name: first.name }));
+
+        const second = testApi.reserveSpawnName("Reviewer", "scout", dir);
+        assert.equal(second.name, "Reviewer-2");
+        assert.equal(reserved.has("Reviewer-2"), true);
+        testApi.releaseSpawnName(second);
+      } finally {
+        runningMap.clear();
+        reserved.clear();
+      }
+    });
+  });
+
+  it("deduplicates explicit names already persisted in the registry", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const reserved = testApi.reservedNames as Set<string>;
+    reserved.clear();
+
+    withTempDir((dir) => {
+      try {
+        seedRegistryRun(dir, "Reviewer", { sessionFile: "/done.jsonl", sessionId: "done" });
+        const reservation = testApi.reserveSpawnName(" Reviewer ", "scout", dir);
+        assert.equal(reservation.name, "Reviewer-2");
+        testApi.releaseSpawnName(reservation);
+      } finally {
+        reserved.clear();
+      }
+    });
+  });
+
+  it("atomically reserves parallel explicit names and acknowledges the actual name", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const reserved = testApi.reservedNames as Set<string>;
+    reserved.clear();
+
+    withTempDir((dir) => {
+      try {
+        const first = testApi.reserveSpawnName("Reviewer", "scout", dir);
+        const second = testApi.reserveSpawnName("Reviewer", "scout", dir);
+        assert.deepEqual([first.name, second.name], ["Reviewer", "Reviewer-2"]);
+
+        const acknowledgement = testApi.createSpawnStartedAcknowledgement({
+          id: "second",
+          name: second.name,
+          task: "review",
+          agent: "scout",
+          sessionFile: "/reviewer-2.jsonl",
+          launchScriptFile: "/reviewer-2.sh",
+        });
+        assert.equal(acknowledgement.details.name, "Reviewer-2");
+        assert.match(acknowledgement.content[0].text, /"Reviewer-2" launched/);
+        testApi.releaseSpawnName(first);
+        testApi.releaseSpawnName(second);
+      } finally {
+        reserved.clear();
+      }
+    });
+  });
+
+  it("does not poll or deliver a pending question after kill aborts a pending screen read", async () => {
+    const controller = new AbortController();
+    let releaseRead!: (screen: string) => void;
+    let readStarted!: () => void;
+    const started = new Promise<void>((resolve) => { readStarted = resolve; });
+    const pendingRead = new Promise<string>((resolve) => { releaseRead = resolve; });
+    let ticks = 0;
+
+    const polling = pollForExit("pane", controller.signal, {
+      interval: 1,
+      readScreen: async () => {
+        readStarted();
+        return pendingRead;
+      },
+      onTick: () => { ticks++; },
+    });
+
+    await started;
+    controller.abort();
+    releaseRead("");
+    await assert.rejects(polling, /Aborted/);
+    assert.equal(ticks, 0, "the watcher tick/question seam must not run after abort");
   });
 
   it("steers a running subagent by typing into its pane (newlines flattened)", () => {
@@ -2361,8 +3424,8 @@ describe("subagent interruption", () => {
 
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
-    // Follow-ups reference the name (not the session id).
-    assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
+    // Completed follow-ups use the explicit safe name-based tool (not a session id).
+    assert.match(presentation, /subagent_resume\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
   });
 
@@ -2388,7 +3451,7 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
-    assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
+    assert.match(presentation, /subagent_resume\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });

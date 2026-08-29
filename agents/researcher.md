@@ -1,9 +1,9 @@
 ---
 name: researcher
-description: Web researcher — searches the web and synthesizes findings
+description: Web researcher using GPT-5.6 Sol with high thinking
 tools: web_search, web_fetch, safe_bash
-model: openrouter/z-ai/glm-5.3
-thinking: medium
+model: openai-codex/gpt-5.6-sol
+thinking: high
 system-prompt: append
 auto-exit: true
 ---

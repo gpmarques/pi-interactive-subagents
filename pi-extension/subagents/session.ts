@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  unlinkSync,
   readFileSync,
   readSync,
   readdirSync,
@@ -13,7 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 export interface SessionEntry {
   type: string;
@@ -82,7 +83,8 @@ export function seedSubagentSessionFile(params: {
 
 /**
  * A snapshot of everything needed to reconstruct a subagent's sandbox when its
- * session is later resumed via `subagent_message({ sessionId })`.
+ * session is later resumed via explicit `subagent_resume({ name, message })`
+ * or the backward-compatible completed path in `subagent_message`.
  *
  * Written next to the session file as `<sessionFile>.loadout.json` at spawn
  * time. Resume replays this exact snapshot so the reincarnated process gets the
@@ -98,6 +100,8 @@ export interface SubagentLoadout {
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
+  /** Exact extension paths backing the restricted allowlist, or null when unrestricted. */
+  toolExtensions: string[] | null;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
@@ -131,14 +135,115 @@ export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoado
   }
 }
 
-/** Read a subagent's loadout snapshot, or null if absent/unparseable. */
+export const SUBAGENT_LIFECYCLE_TOOLS = [
+  "subagent",
+  "subagent_message",
+  "subagent_resume",
+  "subagent_kill",
+  "subagents_list",
+] as const;
+
+const RESUME_LIFECYCLE_TOOLS = new Set<string>(SUBAGENT_LIFECYCLE_TOOLS);
+
+function normalizeSpawnable(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  if (!value.every(
+    (name) =>
+      typeof name === "string" &&
+      name.trim() !== "" &&
+      !name.includes(",") &&
+      !/[\0\r\n]/.test(name),
+  )) return null;
+  return [...new Set(value.map((name) => name.trim()))];
+}
+
+/**
+ * Read and security-normalize a subagent's loadout snapshot.
+ *
+ * `toolAllowlist: null` is the only representation of an intentionally
+ * unrestricted legacy session. Missing, malformed, or caller-supplied empty
+ * allowlists are invalid, so resume refuses instead of treating a falsey value
+ * as ambient access. Lifecycle tools are replayed only with a valid non-empty
+ * spawn whitelist; stale snapshots cannot load this extension with no nested
+ * agent boundary.
+ */
 export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null {
   try {
     const p = loadoutSidecarPath(sessionFile);
     if (!existsSync(p)) return null;
     const parsed = JSON.parse(readFileSync(p, "utf8"));
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed as SubagentLoadout;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const loadout = parsed as Record<string, unknown>;
+
+    const nullableStringFields = ["agent", "model", "thinking", "identity", "cwd", "agentDir"];
+    if (nullableStringFields.some((field) => {
+      const value = loadout[field];
+      return value !== null && (
+        typeof value !== "string" || value.trim() === "" || value.includes("\0")
+      );
+    })) return null;
+
+    const rawAllowlist = loadout.toolAllowlist;
+    if (rawAllowlist !== null && typeof rawAllowlist !== "string") return null;
+
+    // Restricted snapshots must contain the exact extension paths that backed
+    // their allowlist. The only compatibility exception is a complete legacy
+    // unrestricted snapshot: older `toolAllowlist: null` sidecars predate this
+    // field and intentionally relied on ambient extension discovery.
+    const rawToolExtensions = loadout.toolExtensions;
+    let toolExtensions: string[] | null;
+    if (rawAllowlist === null && rawToolExtensions === undefined) {
+      toolExtensions = null;
+    } else if (rawAllowlist === null) {
+      if (rawToolExtensions !== null) return null;
+      toolExtensions = null;
+    } else {
+      if (!Array.isArray(rawToolExtensions)) return null;
+      if (!rawToolExtensions.every(
+        (extensionPath) =>
+          typeof extensionPath === "string" &&
+          extensionPath.trim() !== "" &&
+          isAbsolute(extensionPath) &&
+          !/[\0\r\n]/.test(extensionPath),
+      )) return null;
+      if (new Set(rawToolExtensions).size !== rawToolExtensions.length) return null;
+      toolExtensions = [...rawToolExtensions];
+    }
+
+    if (
+      loadout.systemPromptMode !== null &&
+      loadout.systemPromptMode !== "append" &&
+      loadout.systemPromptMode !== "replace"
+    ) return null;
+    if (loadout.identity !== null && loadout.systemPromptMode === null) return null;
+    if (typeof loadout.autoExit !== "boolean") return null;
+
+    const rawSpawnable = loadout.spawnable;
+    const spawnable = normalizeSpawnable(rawSpawnable);
+    if (rawSpawnable !== null && spawnable === null) return null;
+
+    if (rawAllowlist === null) {
+      return {
+        ...(parsed as SubagentLoadout),
+        toolAllowlist: null,
+        toolExtensions,
+        spawnable,
+      };
+    }
+
+    const rawTools = rawAllowlist.split(",");
+    if (rawTools.some((tool) => tool.trim() === "" || /[\0\r\n]/.test(tool))) return null;
+    const tools = rawTools.map((tool) => tool.trim());
+    const normalizedTools = spawnable
+      ? tools
+      : tools.filter((tool) => !RESUME_LIFECYCLE_TOOLS.has(tool));
+
+    return {
+      ...(parsed as SubagentLoadout),
+      toolAllowlist: [...new Set(normalizedTools)].join(","),
+      toolExtensions,
+      spawnable,
+    };
   } catch {
     return null;
   }
@@ -148,8 +253,9 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
 // Each spawner session (the top-level pi session, or a worker that spawns its
 // own children) gets a registry mapping a subagent's display name to the
 // session file it ran in. Names are unique per spawner session and persist on
-// disk, so `subagent_message({ name })` can steer a running subagent or resume
-// a finished one by the same handle — even across a pi restart. The registry
+// disk, so `subagent_message({ name })` can steer a running subagent or safely
+// resume a finished one (as can explicit `subagent_resume`) by the same handle —
+// even across a pi restart. The registry
 // lives in the spawner's own artifact dir, which is directly addressable from
 // the spawner's session id (no sessions-tree scan, so resume stays fast).
 
@@ -158,6 +264,10 @@ export interface NameRegistryEntry {
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /** Persisted lifecycle proof used to prevent duplicate JSONL writers after a parent restart. */
+  runState?: "pending" | "running" | "completed";
+  /** Identity of the launch that currently owns (or last completed) this session. */
+  runId?: string;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
@@ -185,23 +295,143 @@ export function readNameRegistry(artifactDir: string): NameRegistry {
  * Writes atomically (temp file + rename) so a concurrent reader never sees a
  * partial registry.
  */
-export function registerName(
-  artifactDir: string,
-  name: string,
-  entry: NameRegistryEntry,
-): void {
+function writeNameRegistry(artifactDir: string, registry: NameRegistry): void {
+  mkdirSync(artifactDir, { recursive: true });
+  const p = nameRegistryPath(artifactDir);
+  const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
   try {
-    mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
-    registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
     writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
     renameSync(tmp, p);
-  } catch {
-    // Best-effort: a failed registration only means resume-by-name won't find
-    // this subagent later; it never breaks the spawn itself.
+  } finally {
+    try { unlinkSync(tmp); } catch {}
   }
+}
+
+const REGISTRY_LOCK_TIMEOUT_MS = 1_500;
+const REGISTRY_LOCK_RETRY_MS = 10;
+const registryLockWait = new Int32Array(new SharedArrayBuffer(4));
+
+function waitForRegistryLock(): void {
+  Atomics.wait(registryLockWait, 0, 0, REGISTRY_LOCK_RETRY_MS);
+}
+
+/**
+ * Serialize registry mutations across extension processes with bounded retry.
+ * Lock ownership is never guessed: an abandoned lock requires manual cleanup,
+ * preserving fail-closed single-writer behavior after an uncertain crash.
+ */
+function withRegistryLock<T>(artifactDir: string, mutate: () => T): T {
+  mkdirSync(artifactDir, { recursive: true });
+  const lock = `${nameRegistryPath(artifactDir)}.lock`;
+  const deadline = Date.now() + REGISTRY_LOCK_TIMEOUT_MS;
+  let fd: number;
+  while (true) {
+    try {
+      fd = openSync(lock, "wx");
+      break;
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) {
+        throw new Error(`name registry remained locked for ${REGISTRY_LOCK_TIMEOUT_MS}ms`);
+      }
+      waitForRegistryLock();
+    }
+  }
+  try {
+    writeFileSync(fd!, JSON.stringify({ pid: process.pid, createdAt: Date.now() }), "utf8");
+    return mutate();
+  } finally {
+    closeSync(fd!);
+    try { unlinkSync(lock); } catch {}
+  }
+}
+
+function readNameRegistryForMutation(artifactDir: string): NameRegistry {
+  const registryPath = nameRegistryPath(artifactDir);
+  if (!existsSync(registryPath)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(registryPath, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("registry is not an object");
+    }
+    return parsed as NameRegistry;
+  } catch (error: any) {
+    throw new Error(`name registry cannot be read: ${error?.message ?? String(error)}`);
+  }
+}
+
+/** Atomically choose and durably reserve a unique pending spawn name. */
+export function reserveNameRun(
+  artifactDir: string,
+  base: string,
+  runId: string,
+): string {
+  return withRegistryLock(artifactDir, () => {
+    const registry = readNameRegistryForMutation(artifactDir);
+    let name = base;
+    let suffix = 2;
+    while (Object.hasOwn(registry, name)) {
+      name = `${base}-${suffix++}`;
+    }
+    registry[name] = {
+      sessionFile: "",
+      sessionId: null,
+      runState: "pending",
+      runId,
+    };
+    writeNameRegistry(artifactDir, registry);
+    return name;
+  });
+}
+
+/** Activate only the exact pending reservation owner; never replace a claim. */
+export function activateReservedNameRun(
+  artifactDir: string,
+  name: string,
+  runId: string,
+  entry: Pick<NameRegistryEntry, "sessionFile" | "sessionId">,
+): boolean {
+  return withRegistryLock(artifactDir, () => {
+    const registry = readNameRegistryForMutation(artifactDir);
+    const current = registry[name];
+    if (
+      !current ||
+      current.runState !== "pending" ||
+      current.runId !== runId
+    ) return false;
+
+    registry[name] = {
+      ...entry,
+      runState: "running",
+      runId,
+    };
+    writeNameRegistry(artifactDir, registry);
+    return true;
+  });
+}
+
+/** Remove only an exact pending reservation or activated run owner. */
+export function removeOwnedNameRun(
+  artifactDir: string,
+  name: string,
+  expectedSessionFile: string,
+  runId: string,
+  runState: "pending" | "running",
+): boolean {
+  return withRegistryLock(artifactDir, () => {
+    const registry = readNameRegistryForMutation(artifactDir);
+    const current = registry[name];
+    if (
+      !current ||
+      current.runState !== runState ||
+      current.runId !== runId ||
+      current.sessionFile !== expectedSessionFile
+    ) return false;
+
+    delete registry[name];
+    writeNameRegistry(artifactDir, registry);
+    return true;
+  });
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */
@@ -211,6 +441,130 @@ export function resolveNameInRegistry(
 ): NameRegistryEntry | null {
   const entry = readNameRegistry(artifactDir)[name];
   return entry && typeof entry.sessionFile === "string" ? entry : null;
+}
+
+export type ResumeRunClaimResult =
+  | { ok: true }
+  | { ok: false; reason: "missing" | "changed" | "not-completed"; conflictingName?: string };
+
+function hasValidCompletedOwnership(entry: unknown): entry is NameRegistryEntry & {
+  runState: "completed";
+  runId: string;
+} {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  const candidate = entry as Record<string, unknown>;
+  if (
+    typeof candidate.sessionFile !== "string" ||
+    candidate.sessionFile.trim() === "" ||
+    !isAbsolute(candidate.sessionFile) ||
+    /[\0\r\n]/.test(candidate.sessionFile) ||
+    candidate.runState !== "completed" ||
+    typeof candidate.runId !== "string" ||
+    candidate.runId.trim() === "" ||
+    /[\0\r\n]/.test(candidate.runId)
+  ) return false;
+
+  return Object.hasOwn(candidate, "sessionId") && (
+    candidate.sessionId === null ||
+    (
+      typeof candidate.sessionId === "string" &&
+      candidate.sessionId.trim() !== "" &&
+      !/[\0\r\n]/.test(candidate.sessionId)
+    )
+  );
+}
+
+/**
+ * Atomically claim every name alias mapped to one completed session.
+ *
+ * The persisted running state complements the in-memory reservation in
+ * index.ts: a second parent process (or a restarted parent) must not start a
+ * second writer against the same JSONL. Registry entries predating lifecycle
+ * proof fail closed instead of being guessed completed.
+ */
+export function claimCompletedNameRun(
+  artifactDir: string,
+  name: string,
+  expectedSessionFile: string,
+  runId: string,
+): ResumeRunClaimResult {
+  return withRegistryLock(artifactDir, () => {
+    const registry = readNameRegistryForMutation(artifactDir);
+    const current = registry[name];
+    if (!current) return { ok: false, reason: "missing" };
+    if (
+      typeof expectedSessionFile !== "string" ||
+      expectedSessionFile.trim() === "" ||
+      !isAbsolute(expectedSessionFile) ||
+      /[\0\r\n]/.test(expectedSessionFile) ||
+      typeof runId !== "string" ||
+      runId.trim() === "" ||
+      /[\0\r\n]/.test(runId)
+    ) {
+      return { ok: false, reason: "not-completed", conflictingName: name };
+    }
+    if (!hasValidCompletedOwnership(current)) {
+      return { ok: false, reason: "not-completed", conflictingName: name };
+    }
+    if (resolve(current.sessionFile) !== resolve(expectedSessionFile)) {
+      return { ok: false, reason: "changed" };
+    }
+
+    const sessionKey = resolve(expectedSessionFile);
+    const aliases = Object.entries(registry).filter(([, entry]) =>
+      entry &&
+      typeof entry.sessionFile === "string" &&
+      entry.sessionFile.trim() !== "" &&
+      isAbsolute(entry.sessionFile) &&
+      !/[\0\r\n]/.test(entry.sessionFile) &&
+      resolve(entry.sessionFile) === sessionKey
+    );
+    const malformed = aliases.find(([, entry]) => !hasValidCompletedOwnership(entry));
+    if (malformed) {
+      return {
+        ok: false,
+        reason: "not-completed",
+        conflictingName: malformed[0],
+      };
+    }
+
+    for (const [, entry] of aliases) {
+      entry.runState = "running";
+      entry.runId = runId;
+    }
+    writeNameRegistry(artifactDir, registry);
+    return { ok: true };
+  });
+}
+
+/**
+ * Complete or roll back one claimed run without overwriting a newer owner.
+ * All aliases claimed with the same run id are advanced together.
+ */
+export function markNameRunCompleted(
+  artifactDir: string,
+  expectedSessionFile: string,
+  runId: string,
+): boolean {
+  return withRegistryLock(artifactDir, () => {
+    const registry = readNameRegistryForMutation(artifactDir);
+    const sessionKey = resolve(expectedSessionFile);
+    let changed = false;
+    for (const entry of Object.values(registry)) {
+      if (
+        entry &&
+        typeof entry.sessionFile === "string" &&
+        resolve(entry.sessionFile) === sessionKey &&
+        entry.runState === "running" &&
+        entry.runId === runId
+      ) {
+        entry.runState = "completed";
+        changed = true;
+      }
+    }
+    if (changed) writeNameRegistry(artifactDir, registry);
+    return changed;
+  });
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {
