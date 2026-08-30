@@ -95,13 +95,36 @@ export function seedSubagentSessionFile(params: {
  * resume faithful even if the agent definition is later edited, moved, or
  * deleted.
  */
+export interface PiWebAccessPackageIdentity {
+  source: "npm:pi-web-access";
+  packageRoot: string;
+  packageName: "pi-web-access";
+  packageVersion: string;
+  manifestSha256: string;
+  configPath: string;
+  configState: "absent" | "file";
+  configSha256: string;
+  relevantConfigSha256: string;
+}
+
+export interface ToolExtensionIdentity {
+  /** Canonical real path passed to Pi with `-e`. */
+  path: string;
+  /** SHA-256 of the exact extension entrypoint bytes at spawn time. */
+  sha256: string;
+  /** Package/config identity needed to prove pi-web-access still has the same tool surface. */
+  piWebAccess?: PiWebAccessPackageIdentity;
+}
+
 export interface SubagentLoadout {
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
-  /** Exact extension paths backing the restricted allowlist, or null when unrestricted. */
+  /** Exact canonical extension paths backing the restricted allowlist, or null when unrestricted. */
   toolExtensions: string[] | null;
+  /** Immutable identities for every saved extension path; required even when null. */
+  toolExtensionIdentities: ToolExtensionIdentity[] | null;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
@@ -186,19 +209,20 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
     const rawAllowlist = loadout.toolAllowlist;
     if (rawAllowlist !== null && typeof rawAllowlist !== "string") return null;
 
-    // Restricted snapshots must contain the exact extension paths that backed
-    // their allowlist. The only compatibility exception is a complete legacy
-    // unrestricted snapshot: older `toolAllowlist: null` sidecars predate this
-    // field and intentionally relied on ambient extension discovery.
+    // Every snapshot must carry immutable extension identities. Legacy
+    // sidecars without them fail closed, including unrestricted snapshots.
     const rawToolExtensions = loadout.toolExtensions;
+    const rawToolExtensionIdentities = loadout.toolExtensionIdentities;
     let toolExtensions: string[] | null;
-    if (rawAllowlist === null && rawToolExtensions === undefined) {
+    let toolExtensionIdentities: ToolExtensionIdentity[] | null;
+    if (rawAllowlist === null) {
+      if (rawToolExtensions !== null || rawToolExtensionIdentities !== null) return null;
       toolExtensions = null;
-    } else if (rawAllowlist === null) {
-      if (rawToolExtensions !== null) return null;
-      toolExtensions = null;
+      toolExtensionIdentities = null;
     } else {
-      if (!Array.isArray(rawToolExtensions)) return null;
+      if (!Array.isArray(rawToolExtensions) || !Array.isArray(rawToolExtensionIdentities)) {
+        return null;
+      }
       if (!rawToolExtensions.every(
         (extensionPath) =>
           typeof extensionPath === "string" &&
@@ -207,7 +231,47 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
           !/[\0\r\n]/.test(extensionPath),
       )) return null;
       if (new Set(rawToolExtensions).size !== rawToolExtensions.length) return null;
+      if (rawToolExtensionIdentities.length !== rawToolExtensions.length) return null;
+
+      const validHash = (value: unknown) =>
+        typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+      const validAbsolutePath = (value: unknown) =>
+        typeof value === "string" &&
+        value.trim() !== "" &&
+        isAbsolute(value) &&
+        !/[\0\r\n]/.test(value);
+      const validPiWebAccessIdentity = (value: unknown): value is PiWebAccessPackageIdentity => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+        const identity = value as Record<string, unknown>;
+        return identity.source === "npm:pi-web-access" &&
+          identity.packageName === "pi-web-access" &&
+          typeof identity.packageVersion === "string" &&
+          identity.packageVersion.trim() !== "" &&
+          validAbsolutePath(identity.packageRoot) &&
+          validAbsolutePath(identity.configPath) &&
+          (identity.configState === "absent" || identity.configState === "file") &&
+          validHash(identity.manifestSha256) &&
+          validHash(identity.configSha256) &&
+          validHash(identity.relevantConfigSha256);
+      };
+
+      const identities: ToolExtensionIdentity[] = [];
+      for (let index = 0; index < rawToolExtensionIdentities.length; index++) {
+        const value = rawToolExtensionIdentities[index];
+        if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+        const identity = value as Record<string, unknown>;
+        if (identity.path !== rawToolExtensions[index] || !validHash(identity.sha256)) return null;
+        if (
+          identity.piWebAccess !== undefined &&
+          !validPiWebAccessIdentity(identity.piWebAccess)
+        ) return null;
+        identities.push(value as ToolExtensionIdentity);
+      }
+      if (new Set(identities.map((identity) => identity.path)).size !== identities.length) {
+        return null;
+      }
       toolExtensions = [...rawToolExtensions];
+      toolExtensionIdentities = identities;
     }
 
     if (
@@ -227,6 +291,7 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
         ...(parsed as SubagentLoadout),
         toolAllowlist: null,
         toolExtensions,
+        toolExtensionIdentities,
         spawnable,
       };
     }
@@ -242,6 +307,7 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
       ...(parsed as SubagentLoadout),
       toolAllowlist: [...new Set(normalizedTools)].join(","),
       toolExtensions,
+      toolExtensionIdentities,
       spawnable,
     };
   } catch {

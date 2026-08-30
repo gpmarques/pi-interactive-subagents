@@ -547,6 +547,14 @@ export function cleanupOwnedChildSessionFiles(sessionFiles: string[]): void {
         }
       }
     }
+    const settledDirectory = `${sessionFile}.idle`;
+    try {
+      rmSync(settledDirectory, { recursive: true, force: true });
+    } catch (error) {
+      errors.push(new Error(
+        `Failed to remove owned child settled directory ${settledDirectory}: ${error instanceof Error ? error.message : String(error)}`,
+      ));
+    }
   }
 
   for (const sessionDir of sessionDirs) {

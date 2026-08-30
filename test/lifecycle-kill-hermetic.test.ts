@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -95,7 +96,14 @@ describe("hermetic lifecycle kill", () => {
       const otherSessionFile = join(root, "other.jsonl");
       writeFileSync(sessionFile, '{"type":"session","id":"child"}\n');
       writeFileSync(otherSessionFile, '{"type":"session","id":"other"}\n');
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "Ship now?" }));
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "legacy" }));
+      writeFileSync(`${sessionFile}.ask.claim`, JSON.stringify({ question: "legacy claim" }));
+      mkdirSync(`${sessionFile}.idle`);
+      writeFileSync(
+        join(`${sessionFile}.idle`, "00000001.json"),
+        JSON.stringify({ type: "settled", state: "idle", response: "STALE_IDLE_RESPONSE" }),
+      );
+      writeFileSync(join(`${sessionFile}.idle`, ".partial.tmp"), "{\"type\":\"settled\"");
       assert.equal(reserveNameRun(root, "Worker", "child-1"), "Worker");
       assert.equal(
         activateReservedNameRun(root, "Worker", "child-1", {
@@ -147,7 +155,7 @@ describe("hermetic lifecycle kill", () => {
           markReadStarted();
           return pendingRead;
         },
-        onTick: () => testApi.deliverPendingQuestion(running),
+        onTick: () => testApi.deliverPendingSettled(running),
       });
       const watcherDelivery = polling.then(
         () => {
@@ -165,9 +173,8 @@ describe("hermetic lifecycle kill", () => {
       await assert.rejects(polling, /Aborted/);
       await watcherDelivery;
       assert.equal(testApi.shouldSuppressWatcherMessage(running), true);
-      // Defense in depth: even a stale caller that reaches the delivery helper
-      // after abort must observe the killed flag and stay silent.
-      testApi.deliverPendingQuestion(running);
+      // Defense in depth: stale delivery callers after abort stay silent.
+      testApi.deliverPendingSettled(running);
 
       assert.equal(readFileSync(tmuxLog, "utf8").trim(), "kill-pane -t %fake-child");
       assert.equal(watcherAbort.signal.aborted, true);
@@ -177,7 +184,13 @@ describe("hermetic lifecycle kill", () => {
       assert.equal(resolveNameInRegistry(root, "Worker"), null);
       assert.equal(resolveNameInRegistry(root, "Other")?.sessionId, "other");
       assert.equal(existsSync(sessionFile), true, "kill preserves the child transcript");
-      assert.equal(sentMessages.length, 0, "no pending .ask question is steered after kill");
+      assert.deepEqual(
+        readdirSync(root).filter((name) => name.startsWith("child.jsonl.ask")),
+        [],
+        "kill discards legacy question artifacts",
+      );
+      assert.equal(existsSync(`${sessionFile}.idle`), false, "kill discards stale idle delivery");
+      assert.equal(sentMessages.length, 0, "no settled record is sent after kill");
     } finally {
       runningMap?.clear();
       if (previous.PATH === undefined) delete process.env.PATH;

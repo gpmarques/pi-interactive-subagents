@@ -1,6 +1,6 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/earendil-works/pi-mono), running on tmux or Herdr terminal surfaces. Spawn a sub-agent, keep working in the main session, and receive its result in a follow-up turn when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/earendil-works/pi-mono), running on tmux or Herdr terminal surfaces. Spawn a sub-agent, keep working in the main session, and automatically receive either its result after exit or an idle report when it settles but remains alive. Fully non-blocking.
 
 This fork supports exactly two terminal backends: [tmux](https://github.com/tmux/tmux) and Herdr. See [Acknowledgements](#acknowledgements) for its relationship to the HazAT original.
 
@@ -8,7 +8,7 @@ For a component and lifecycle overview, see the [coarse system map](docs/system-
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own terminal surface while a live widget above the input tracks every running sub-agent. When one finishes, its result is delivered to the main session as a follow-up notification that triggers a new turn, even when completion races with the end of the current parent turn.
+`subagent()` returns immediately. The sub-agent runs in its own terminal surface while a live widget above the input tracks every running sub-agent. Pi-backed children follow one lifecycle invariant: every fully settled child either exits for normal result delivery, or remains alive and atomically publishes one immutable state record for that settled cycle. The parent drains accumulated records in creation order as one notification per batch: `subagent_question` when the newest state awaits an answer, otherwise `subagent_idle`. Notifications include the latest assistant response when available and never infer finality from its wording.
 
 Surface placement is backend-specific and focus-preserving. tmux creates a detached right split from the caller pane. Herdr creates a background tab in the caller's explicit workspace with `--no-focus`, so the parent remains focused. Launches and later reads/messages/closes target explicit surface IDs; each surface stays pinned to the backend that created it even if environment variables change.
 
@@ -87,11 +87,13 @@ Every spawn records name → session file plus durable run ownership in `artifac
 
 `subagent_kill({ name })` is a destructive lifecycle operation for a currently running child. It targets only the exact persistent display name, kills the child’s terminal surface/process (Pi or Claude CLI), aborts its watcher, removes it from the running widget, and forgets the name mapping so it cannot be resumed or reused until a fresh spawn. Existing session/transcript history is preserved; kill does not delete it. If surface termination fails, the operation reports an error and leaves tracking intact rather than claiming success. Completion/error follow-ups and pending-question steer messages are suppressed.
 
-**Pi resume replays the original sandbox.** At spawn time the fully resolved loadout—tool allowlist, exact backing-extension paths, model, thinking level, system-prompt identity, nested-spawn whitelist, cwd, and agent dir—is snapshotted to `<session>.loadout.json`. Both resume entrypoints validate and rebuild from that snapshot rather than rediscovering a profile or accepting caller launch controls. Missing, malformed, incomplete, empty-string, or unavailable restricted snapshots are refused before terminal-surface creation. Complete legacy `toolAllowlist: null` snapshots remain intentionally unrestricted, but any resume without a valid non-empty spawn whitelist suppresses all subagent lifecycle tools, including `subagent_resume`.
+**Pi resume revalidates the original sandbox identity.** At spawn time the fully resolved loadout—tool allowlist, canonical backing-extension paths and SHA-256 digests, model, thinking level, system-prompt identity, nested-spawn whitelist, cwd, and agent dir—is recorded in `<session>.loadout.json`. For `pi-web-access`, the record additionally binds the canonical package root/name/version, manifest digest, and complete `web-search.json` bytes (or absence) plus the relevant tool config. Both resume entrypoints validate and rebuild from that record rather than rediscovering a profile or accepting caller launch controls. Missing, malformed, incomplete, empty-string, unavailable, symlink-replaced, or drifted recorded identities are refused before terminal-surface creation. Legacy sidecars without the required extension/package/config identity are also refused, including formerly unrestricted snapshots.
+
+A saved loadout is a validation record, **not a copy of old executable code**. Resume rechecks the recorded entrypoint, manifest/package version, and config identity, then runs the same fresh capability probe before creating a surface. Treat every `pi-web-access` package or config update as requiring a **fresh child**; resumes are refused when a recorded field changes. This focused guarantee does not hash the complete package/dependency tree or npm lock, so same-version helper or dependency-tree mutation that leaves those recorded fields unchanged is outside the resume-identity guarantee.
 
 ### ask_question
 
-A Pi-backed sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The session **stays open** (parked as `waiting`) instead of exiting; the parent is notified with the sub-agent's name, replies via `subagent_message({ name, message })`, and the reply arrives as the sub-agent's next turn. Parallel questions are supported — each waiting sub-agent has its own name.
+A Pi-backed sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The session **stays open** instead of exiting. `ask_question` stores the pending question in child memory; every non-shutdown `agent_settled` atomically publishes one immutable record describing the current state (`awaiting_answer`, `waiting_on_children`, or `idle`), latest response, and question when applicable. The parent drains accumulated records in one ordered notification whose newest state is explicit, then replies through `subagent_message({ name, message })`. Actual external `input` clears the pending question for later records; retry, compaction recovery, and continuation `agent_start` events do not. Historical records are never cancelled or rewritten. Failed parent sends retain the whole batch for retry, while exit, kill, and resume discard pending records.
 
 If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the terminal surface stays open until a human closes it. Only available inside sub-agent sessions.
 
@@ -100,11 +102,11 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
 | **planner** | `openai-codex/gpt-5.6-sol` | `read`, `write`, `bash` + spawning | Interactive planning specialist; writes one plan artifact and may spawn `scout` and `researcher` for factual gaps |
-| **researcher** | `openai-codex/gpt-5.6-sol` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **researcher** | `openai-codex/gpt-5.6-sol` | `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash` | Web research, synthesized into a sourced brief |
 | **reviewer** | `openai-codex/gpt-5.6-sol` | `read`, `bash` | Read-only review of introduced changes against task intent and a fixed point |
 | **scout** | `openai-codex/gpt-5.6-sol` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
 | **visual-tester** | `openai-codex/gpt-5.6-sol` | `read`, `write`, `bash` | Autonomous visual QA through an ambient-sanitizing temporary `agent-browser` wrapper; reports evidence without editing implementation |
-| **worker** | `openai-codex/gpt-5.6-sol` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **worker** | `openai-codex/gpt-5.6-sol` | `read`, `write`, `edit`, `bash` + spawning | General implementer; delegates external research to `researcher` and may also spawn `scout` |
 
 Six agents are bundled. Scout, researcher, reviewer, visual-tester, and worker are autonomous (`auto-exit: true`). Planner is explicitly interactive (`interactive: true`, `auto-exit: false`) and remains open for user-led planning. All six carry their identity in the system prompt (`system-prompt: append`).
 
@@ -134,7 +136,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed for Pi: `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the lifecycle/spawning toolset** (`subagent`, `subagent_message`, `subagent_resume`, `subagent_kill`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn or use lifecycle tools |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -153,7 +155,9 @@ You are a specialized agent that does X...
 
 ### auto-exit
 
-With `auto-exit: true`, the session shuts down when the agent's turn ends — the agent just writes its final message and stops (there is no "done" tool). The last assistant message becomes the summary returned to the parent. Recommended for all autonomous agents.
+With `auto-exit: true`, the session requests shutdown after a normally completed agent run — the agent just writes its final message and stops (there is no "done" tool). The shutdown path delivers the last assistant message as the result and suppresses a duplicate idle report. Recommended for all autonomous agents.
+
+Idle publication uses Pi's `agent_settled` event, not `agent_end`: retries, automatic compaction/retry, and queued continuations must finish first. A Pi process that remains alive then atomically publishes one durable record file for the parent watcher; interrupted temporary files are ignored and rapid repeated turns cannot overwrite or block one another. No language-based completion heuristic is used.
 
 Notes:
 
@@ -166,7 +170,13 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-**Pi-backed profiles are whitelist-only.** They launch with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only extensions backing listed tools are loaded explicitly. Omitted `tools` yields only `ask_question`, not Pi's ambient defaults. This restriction survives resume through the validated loadout snapshot.
+**Pi-backed profiles are whitelist-only.** They launch with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only extensions backing listed tools are loaded explicitly. Omitted `tools` yields only `ask_question`, not Pi's ambient defaults. This restriction survives resume through the validated loadout record.
+
+The bundled profile configuration grants the four web tools only to `researcher`; no other bundled profile requests them. They all resolve to one canonical extension entrypoint from the effective child agent directory's `<agent-dir>/npm/node_modules/pi-web-access/package.json` (`pi.extensions`). Resolution requires exactly one unfiltered string `"npm:pi-web-access"` in that agent directory's `settings.json`, verifies exactly `pi-web-access@0.27.0`, and requires all four canonical tools to remain enabled and unrenamed in `web-search.json`. Package roots, manifests, entrypoints, settings, and config must remain canonical and inside their allowed roots; symlinks at those checked paths are rejected. A stale package beside Pi's installation is not a fallback, and unrelated global packages are never scanned.
+
+Metadata validation alone does not authorize a researcher launch. Before any researcher surface is created, the extension starts the canonical Pi executable in the exact child cwd and effective agent directory with `--mode rpc --offline --no-session --no-extensions`, the exact four-tool `--tools` allowlist, the validated package entrypoint, and a private no-tool inspector. It issues only RPC `get_state`, then requires Pi's fresh active-tool set to equal the four canonical names. The process is capped at 5 seconds in a detached process group; the group is killed with `SIGKILL` during cleanup and its nonce-bound temporary snapshot is removed in `finally`. No persistent session or prompt is created, and no model/provider or web call is made. Missing/partial/renamed registration, extension errors, malformed or uninspectable RPC state, timeout, or nonzero exit fails closed with repair guidance before surface or loadout creation. On the current verified installation the isolated preflight measured about 0.25–0.30 seconds.
+
+Ambient loading remains disabled for the real child: the validated entrypoint is passed once with `-e` while the complete child `--tools` allowlist selects the web tools plus `safe_bash` and ordinary `ask_question`. After a successful initial preflight, the launch records the canonical entrypoint digest, package root/name/version and manifest digest, and full/relevant config identity. Resume verifies those fields before the probe and again afterward. Recorded drift rejects before a surface; same-version unrecorded helper/dependency drift is not claimed to be detected.
 
 **Claude-backed profiles use a separate verified policy.** Before launch, the extension checks installed `claude --help` for the policy flags it relies on, then uses `--tools`, matching `--allowedTools`, `--permission-mode dontAsk`, no ambient setting sources, and strict empty MCP configuration. It never uses `--dangerously-skip-permissions`. Supported profile mappings are `read→Read`, `write→Write`, `edit→Edit`, `bash→Bash`, `grep→Grep`, `find→Glob`, `web_search→WebSearch`, and `web_fetch→WebFetch`; omitted `tools` disables all Claude tools. Because Pi extensions and nested Pi spawning cannot be represented faithfully in Claude Code, a Claude profile requesting any other tool or declaring `subagent_agents` is refused before terminal-surface creation. Parent-side `subagent_kill` remains available for a running Claude child.
 
@@ -193,7 +203,7 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Status widget & configuration
 
-The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
+The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (an explicit question, or fully settled and open for input/another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Outside the explicit `ask_question` path, `waiting` is recorded at `agent_settled`, so an intermediate `agent_end` during retry or continuation is not exposed as idle. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
 
@@ -208,6 +218,7 @@ Status display is configured via `config.json` in the extension directory (copy 
 - [pi](https://github.com/earendil-works/pi-mono)
 - Either Herdr or [tmux](https://github.com/tmux/tmux)
 - `agent-browser` on `PATH` when using the bundled `visual-tester`. The agent reports a blocked run if it is missing; it never installs a browser tool or uses a fallback.
+- [`pi-web-access`](https://github.com/nicobailon/pi-web-access) when using the bundled `researcher`. Install it separately with `pi install npm:pi-web-access`; this project does not vendor it.
 
 Start Pi inside either supported backend:
 
@@ -236,6 +247,18 @@ Run these commands from the repository root inside the matching terminal backend
 ```bash
 PI_SUBAGENT_MUX=herdr npm run test:integration:surface
 PI_SUBAGENT_MUX=tmux npm run test:integration:surface
+```
+
+The web-tool capability checks make no model or web calls. The production-boundary hermetic test proves that exact-name/version packages registering zero, partial, renamed, or all four tools cannot create a researcher surface unless the fresh capability probe succeeds; it also covers malformed output, extension errors, nonzero exit, timeout bounds, and temporary cleanup:
+
+```bash
+env -u PI_SUBAGENT_LIFECYCLE_DISABLED npm run test:web-preflight-hermetic
+```
+
+The broader profile check starts a fresh offline Pi RPC runtime for every bundled profile—never a saved loadout—and records Pi's active tools to prove that only `researcher` receives all four `pi-web-access` tools:
+
+```bash
+npm run test:integration:web-tools
 ```
 
 The dedicated Herdr lifecycle smoke uses real `openai-codex/gpt-5.6-sol` calls. It intentionally covers only the public completion/result-follow-up/explicit-resume and kill/forget/resume-refusal paths. Cleanup checks exact focus, pane IDs, and tab IDs without closing unknown resources:

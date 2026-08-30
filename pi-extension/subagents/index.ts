@@ -1,9 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { execFileSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -12,9 +13,13 @@ import {
   existsSync,
   mkdirSync,
   copyFileSync,
+  lstatSync,
   unlinkSync,
+  rmSync,
+  renameSync,
+  realpathSync,
+  statSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -46,9 +51,12 @@ import {
   summarizeSessionStats,
   SUBAGENT_LIFECYCLE_TOOLS,
   writeSubagentLoadout,
+  type PiWebAccessPackageIdentity,
   type SessionStats,
   type SubagentLoadout,
+  type ToolExtensionIdentity,
 } from "./session.ts";
+import { preflightPiWebAccessCapabilities } from "./pi-web-access-runtime.ts";
 import {
   type StatusSnapshot,
   type SubagentStatusState,
@@ -71,6 +79,7 @@ import {
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+const PI_WEB_ACCESS_PREFLIGHT_INSPECTOR = join(SUBAGENTS_DIR, "pi-web-access-preflight.ts");
 
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
@@ -178,7 +187,413 @@ const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", 
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  return getAgentDir();
+}
+
+const PI_WEB_ACCESS_PACKAGE = "pi-web-access";
+const PI_WEB_ACCESS_SOURCE = "npm:pi-web-access" as const;
+const SUPPORTED_PI_WEB_ACCESS_VERSION = "0.27.0";
+const PI_WEB_ACCESS_TOOL_NAMES = {
+  webSearch: "web_search",
+  fetchContent: "fetch_content",
+  getSearchContent: "get_search_content",
+  sourceCheck: "source_check",
+} as const;
+const PI_WEB_ACCESS_TOOLS = new Set(Object.values(PI_WEB_ACCESS_TOOL_NAMES));
+
+interface ResolvedPiWebAccess {
+  extensionPath: string;
+  packageIdentity: PiWebAccessPackageIdentity;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPathInside(root: string, candidate: string, allowRoot = false): boolean {
+  const rel = relative(root, candidate);
+  if (rel === "") return allowRoot;
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+function sha256(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function readCanonicalFile(path: string, boundaryRoot: string, label: string): {
+  path: string;
+  content: Buffer;
+} {
+  let canonicalPath: string;
+  try {
+    canonicalPath = realpathSync(path);
+    if (!statSync(canonicalPath).isFile()) throw new Error("not a file");
+  } catch (error: any) {
+    throw piWebAccessError(`${label} is unavailable at ${path}: ${error?.message ?? String(error)}`);
+  }
+  if (!isPathInside(boundaryRoot, canonicalPath)) {
+    throw piWebAccessError(`${label} resolves outside its allowed root: ${path}`);
+  }
+  return { path: canonicalPath, content: readFileSync(canonicalPath) };
+}
+
+function configuredPackageSource(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  return isPlainObject(value) && typeof value.source === "string" ? value.source : undefined;
+}
+
+function sourceLooksLikePiWebAccess(source: string, settingsDir: string): boolean {
+  if (source.startsWith("npm:")) {
+    return /^npm:pi-web-access(?:@|$)/.test(source);
+  }
+
+  const withoutFragment = source.replace(/[?#].*$/, "");
+  const withoutRef = withoutFragment.replace(/@[^/@]*$/, "");
+  const basenameLike = withoutRef
+    .replace(/[\\/]+$/, "")
+    .split(/[\\/:]/)
+    .at(-1)
+    ?.replace(/\.git$/, "");
+  if (basenameLike === PI_WEB_ACCESS_PACKAGE) return true;
+
+  if (/^(?:git:|https?:|ssh:|git:)/.test(source)) return false;
+  try {
+    const localPath = isAbsolute(source) ? source : resolve(settingsDir, source);
+    const manifestPath = statSync(localPath).isDirectory()
+      ? join(localPath, "package.json")
+      : localPath;
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    return isPlainObject(manifest) && manifest.name === PI_WEB_ACCESS_PACKAGE;
+  } catch {
+    return false;
+  }
+}
+
+function piWebAccessError(reason: string): Error {
+  return new Error(
+    `Cannot provide pi-web-access tools: ${reason}. ` +
+      `Register and install exactly \`${PI_WEB_ACCESS_SOURCE}\` with ` +
+      `\`pi install ${PI_WEB_ACCESS_SOURCE}\`, or repair it with ` +
+      `\`pi update ${PI_WEB_ACCESS_SOURCE}\`, then start a fresh subagent; ` +
+      "saved loadouts keep immutable canonical entrypoint, package/version/manifest, and full-config identity.",
+  );
+}
+
+function readPiWebAccessRegistration(agentDir: string): {
+  canonicalAgentDir: string;
+  settingsPath: string;
+} {
+  let canonicalAgentDir: string;
+  try {
+    canonicalAgentDir = realpathSync(agentDir);
+    if (!statSync(canonicalAgentDir).isDirectory()) throw new Error("not a directory");
+  } catch (error: any) {
+    throw piWebAccessError(
+      `Pi's effective agent directory is unavailable at ${agentDir}: ${error?.message ?? String(error)}`,
+    );
+  }
+
+  const settings = readCanonicalFile(
+    join(agentDir, "settings.json"),
+    canonicalAgentDir,
+    "effective Pi settings",
+  );
+  if (settings.path !== join(canonicalAgentDir, "settings.json")) {
+    throw piWebAccessError("effective Pi settings must not be a symlink or redirected path");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(settings.content.toString("utf8"));
+  } catch (error: any) {
+    throw piWebAccessError(`invalid effective Pi settings at ${settings.path}: ${error?.message ?? String(error)}`);
+  }
+  if (!isPlainObject(parsed) || !Array.isArray(parsed.packages)) {
+    throw piWebAccessError(`effective Pi settings at ${settings.path} must contain a packages array`);
+  }
+
+  const exact = parsed.packages.filter((entry) => entry === PI_WEB_ACCESS_SOURCE);
+  const alternatives = parsed.packages
+    .map(configuredPackageSource)
+    .filter((source): source is string => !!source)
+    .filter((source) => source !== PI_WEB_ACCESS_SOURCE && sourceLooksLikePiWebAccess(source, dirname(settings.path)));
+  const filteredExact = parsed.packages.some(
+    (entry) => isPlainObject(entry) && entry.source === PI_WEB_ACCESS_SOURCE,
+  );
+  if (exact.length !== 1 || alternatives.length > 0 || filteredExact) {
+    const detail = alternatives.length > 0
+      ? `; unsupported alternatives were also configured: ${alternatives.join(", ")}`
+      : filteredExact
+        ? "; object/filter registrations are not accepted"
+        : "";
+    throw piWebAccessError(
+      `effective Pi settings must register exactly one unfiltered string \"${PI_WEB_ACCESS_SOURCE}\"${detail}`,
+    );
+  }
+
+  return { canonicalAgentDir, settingsPath: settings.path };
+}
+
+function readRelevantPiWebAccessConfig(canonicalAgentDir: string): {
+  configPath: string;
+  configState: "absent" | "file";
+  configSha256: string;
+  relevantConfigSha256: string;
+} {
+  const declaredPath = join(canonicalAgentDir, "web-search.json");
+  let configPath = declaredPath;
+  let configState: "absent" | "file" = "absent";
+  let configSha256 = sha256("pi-web-access-config-absent\0");
+  let config: Record<string, unknown> = {};
+  let configEntryExists = false;
+  try {
+    lstatSync(declaredPath);
+    configEntryExists = true;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      throw piWebAccessError(
+        `pi-web-access config cannot be inspected at ${declaredPath}: ${error?.message ?? String(error)}`,
+      );
+    }
+  }
+  if (configEntryExists) {
+    const configFile = readCanonicalFile(declaredPath, canonicalAgentDir, "pi-web-access config");
+    if (configFile.path !== declaredPath) {
+      throw piWebAccessError("pi-web-access config must not be a symlink or redirected path");
+    }
+    configPath = configFile.path;
+    configState = "file";
+    configSha256 = sha256(configFile.content);
+    try {
+      const parsed = JSON.parse(configFile.content.toString("utf8"));
+      if (!isPlainObject(parsed)) throw new Error("expected a JSON object");
+      config = parsed;
+    } catch (error: any) {
+      throw piWebAccessError(`invalid pi-web-access config at ${configPath}: ${error?.message ?? String(error)}`);
+    }
+  }
+
+  const relevant: Record<string, unknown> = {};
+  for (const section of ["webSearch", "tools", "toolNames"] as const) {
+    relevant[section] = Object.hasOwn(config, section)
+      ? { present: true, value: config[section] }
+      : { present: false };
+  }
+
+  if (Object.hasOwn(config, "webSearch")) {
+    if (!isPlainObject(config.webSearch)) {
+      throw piWebAccessError(`webSearch in ${configPath} must be an object`);
+    }
+    if (
+      Object.hasOwn(config.webSearch, "enabled") &&
+      typeof config.webSearch.enabled !== "boolean"
+    ) {
+      throw piWebAccessError(`webSearch.enabled in ${configPath} must be a boolean`);
+    }
+    if (config.webSearch.enabled === false) {
+      throw piWebAccessError(`webSearch.enabled in ${configPath} disables canonical web tools`);
+    }
+  }
+
+  if (Object.hasOwn(config, "tools") && !isPlainObject(config.tools)) {
+    throw piWebAccessError(`tools in ${configPath} must be an object`);
+  }
+  const toolsConfig = isPlainObject(config.tools) ? config.tools : {};
+  for (const key of Object.keys(PI_WEB_ACCESS_TOOL_NAMES)) {
+    if (!Object.hasOwn(toolsConfig, key)) continue;
+    const value = toolsConfig[key];
+    if (!isPlainObject(value)) {
+      throw piWebAccessError(`tools.${key} in ${configPath} must be an object`);
+    }
+    if (Object.hasOwn(value, "enabled") && typeof value.enabled !== "boolean") {
+      throw piWebAccessError(`tools.${key}.enabled in ${configPath} must be a boolean`);
+    }
+    if (value.enabled === false) {
+      throw piWebAccessError(`tools.${key}.enabled in ${configPath} disables a required canonical tool`);
+    }
+  }
+
+  if (Object.hasOwn(config, "toolNames") && !isPlainObject(config.toolNames)) {
+    throw piWebAccessError(`toolNames in ${configPath} must be an object`);
+  }
+  const configuredNames = isPlainObject(config.toolNames) ? config.toolNames : {};
+  for (const [key, canonicalName] of Object.entries(PI_WEB_ACCESS_TOOL_NAMES)) {
+    if (!Object.hasOwn(configuredNames, key)) continue;
+    if (configuredNames[key] !== canonicalName) {
+      throw piWebAccessError(
+        `toolNames.${key} in ${configPath} must remain the canonical name \"${canonicalName}\"`,
+      );
+    }
+  }
+
+  return {
+    configPath,
+    configState,
+    configSha256,
+    relevantConfigSha256: sha256(JSON.stringify(relevant)),
+  };
+}
+
+/** Resolve only the effectively registered user npm package and verify its declared four-tool surface. */
+function resolvePiWebAccessMetadata(agentDir = getAgentConfigDir()): ResolvedPiWebAccess {
+  const { canonicalAgentDir } = readPiWebAccessRegistration(agentDir);
+  const declaredNpmRoot = join(agentDir, "npm", "node_modules");
+  let canonicalNpmRoot: string;
+  let packageRoot: string;
+  try {
+    canonicalNpmRoot = realpathSync(declaredNpmRoot);
+    if (!statSync(canonicalNpmRoot).isDirectory()) throw new Error("npm root is not a directory");
+    packageRoot = realpathSync(join(declaredNpmRoot, PI_WEB_ACCESS_PACKAGE));
+    if (!statSync(packageRoot).isDirectory()) throw new Error("package root is not a directory");
+  } catch (error: any) {
+    throw piWebAccessError(
+      `the registered package is unavailable under Pi's effective npm root ${declaredNpmRoot}: ${error?.message ?? String(error)}`,
+    );
+  }
+  if (
+    !isPathInside(canonicalNpmRoot, packageRoot) ||
+    relative(canonicalNpmRoot, packageRoot) !== PI_WEB_ACCESS_PACKAGE
+  ) {
+    throw piWebAccessError(
+      `the ${PI_WEB_ACCESS_PACKAGE} package root is symlinked or resolves outside Pi's effective npm root`,
+    );
+  }
+
+  const manifestFile = readCanonicalFile(
+    join(packageRoot, "package.json"),
+    packageRoot,
+    `${PI_WEB_ACCESS_PACKAGE} manifest`,
+  );
+  if (manifestFile.path !== join(packageRoot, "package.json")) {
+    throw piWebAccessError(`${PI_WEB_ACCESS_PACKAGE} manifest must not be a symlink`);
+  }
+
+  let manifest: Record<string, any>;
+  try {
+    const parsed = JSON.parse(manifestFile.content.toString("utf8"));
+    if (!isPlainObject(parsed)) throw new Error("expected a JSON object");
+    manifest = parsed;
+  } catch (error: any) {
+    throw piWebAccessError(`invalid manifest at ${manifestFile.path}: ${error?.message ?? String(error)}`);
+  }
+  if (manifest.name !== PI_WEB_ACCESS_PACKAGE) {
+    throw piWebAccessError(
+      `invalid package identity at ${manifestFile.path} (expected name \"${PI_WEB_ACCESS_PACKAGE}\")`,
+    );
+  }
+  if (manifest.version !== SUPPORTED_PI_WEB_ACCESS_VERSION) {
+    throw piWebAccessError(
+      `unsupported ${PI_WEB_ACCESS_PACKAGE} version ${JSON.stringify(manifest.version)}; ` +
+        `verified compatibility requires exactly ${SUPPORTED_PI_WEB_ACCESS_VERSION}`,
+    );
+  }
+
+  const extensions = manifest.pi?.extensions;
+  if (
+    !Array.isArray(extensions) ||
+    extensions.length !== 1 ||
+    typeof extensions[0] !== "string" ||
+    extensions[0].trim() === ""
+  ) {
+    throw piWebAccessError(
+      `invalid ${PI_WEB_ACCESS_PACKAGE} manifest at ${manifestFile.path} ` +
+        "(pi.extensions must name exactly one concrete extension entrypoint)",
+    );
+  }
+
+  const extensionSpec = extensions[0];
+  const traversal = extensionSpec.split(/[\\/]+/).includes("..");
+  if (
+    extensionSpec !== extensionSpec.trim() ||
+    /[\0\r\n]/.test(extensionSpec) ||
+    isAbsolute(extensionSpec) ||
+    /^[A-Za-z][A-Za-z0-9+.-]*:/.test(extensionSpec) ||
+    extensionSpec.startsWith("~") ||
+    extensionSpec.includes("\\") ||
+    traversal ||
+    /[*?{}[\]!]/.test(extensionSpec)
+  ) {
+    throw piWebAccessError(
+      `unsupported or escaping extension entrypoint in ${manifestFile.path}: ${extensionSpec}`,
+    );
+  }
+
+  const declaredEntrypoint = resolve(packageRoot, extensionSpec);
+  if (!isPathInside(packageRoot, declaredEntrypoint)) {
+    throw piWebAccessError(
+      `extension entrypoint escapes the package root in ${manifestFile.path}: ${extensionSpec}`,
+    );
+  }
+  const extensionFile = readCanonicalFile(
+    declaredEntrypoint,
+    packageRoot,
+    "pi-web-access extension entrypoint",
+  );
+  if (extensionFile.path !== declaredEntrypoint) {
+    throw piWebAccessError("pi-web-access extension entrypoint must not be a symlink or redirected path");
+  }
+  const configIdentity = readRelevantPiWebAccessConfig(canonicalAgentDir);
+  return {
+    extensionPath: extensionFile.path,
+    packageIdentity: {
+      source: PI_WEB_ACCESS_SOURCE,
+      packageRoot,
+      packageName: PI_WEB_ACCESS_PACKAGE,
+      packageVersion: manifest.version,
+      manifestSha256: sha256(manifestFile.content),
+      ...configIdentity,
+    },
+  };
+}
+
+function hasPiWebAccessTools(toolAllowlist: string | null): boolean {
+  if (toolAllowlist === null) return false;
+  const tools = new Set(toolAllowlist.split(","));
+  const requested = [...PI_WEB_ACCESS_TOOLS].filter((tool) => tools.has(tool));
+  if (requested.length > 0 && requested.length !== PI_WEB_ACCESS_TOOLS.size) {
+    throw piWebAccessError("a restricted loadout must request all four canonical web tools together");
+  }
+  return requested.length === PI_WEB_ACCESS_TOOLS.size;
+}
+
+function findResolvedPiWebAccessExtension(
+  toolExtensions: string[] | null,
+  agentDir: string,
+): string {
+  let packageRoot: string;
+  try {
+    packageRoot = realpathSync(join(agentDir, "npm", "node_modules", PI_WEB_ACCESS_PACKAGE));
+  } catch (error: any) {
+    throw piWebAccessError(
+      `validated package root became unavailable before capability preflight: ${error?.message ?? String(error)}`,
+    );
+  }
+  const matches = (toolExtensions ?? []).filter((path) => isPathInside(packageRoot, path));
+  if (matches.length !== 1) {
+    throw piWebAccessError("the resolved restricted extension list does not contain exactly one package entrypoint");
+  }
+  return matches[0];
+}
+
+function preflightResolvedPiWebAccess(params: {
+  cwd: string;
+  agentDir: string;
+  extensionPath: string;
+}): { durationMs: number; piExecutable: string } {
+  try {
+    return preflightPiWebAccessCapabilities({
+      ...params,
+      inspectorPath: PI_WEB_ACCESS_PREFLIGHT_INSPECTOR,
+    });
+  } catch (error: any) {
+    throw piWebAccessError(
+      `fresh bounded offline Pi capability preflight failed: ${error?.message ?? String(error)}`,
+    );
+  }
+}
+
+function resolvePiWebAccessExtension(agentDir = getAgentConfigDir()): string {
+  return resolvePiWebAccessMetadata(agentDir).extensionPath;
 }
 
 // ── Runtime tool-extension registration ─────────────────────────────────────
@@ -197,6 +612,9 @@ export function registerToolExtension(name: string, extensionPath: string): void
   }
   if ((SPAWNING_TOOLS as readonly string[]).includes(name)) {
     throw new Error(`Cannot register custom tool "${name}": shadows a spawning tool`);
+  }
+  if (PI_WEB_ACCESS_TOOLS.has(name)) {
+    throw new Error(`Cannot register custom tool "${name}": reserved for ${PI_WEB_ACCESS_PACKAGE}`);
   }
   const existing = EXTRA_TOOL_EXTENSIONS.get(name);
   if (existing === extensionPath) return; // idempotent / reload-safe
@@ -219,18 +637,25 @@ export function registerToolExtension(name: string, extensionPath: string): void
  * Map a custom (non-built-in) tool name to the pi-extension file that
  * registers it. Used to build the child's `--extension` whitelist after
  * `--no-extensions` disables global discovery. Returns undefined for built-in
- * tools and for unknown names (which simply won't be granted).
+ * tools and for unknown names (which simply won't be granted). Requested
+ * pi-web-access tools instead fail closed when the named package or its
+ * manifest entrypoint cannot be validated.
  */
-function getToolExtensionPath(tool: string): string | undefined {
+function getToolExtensionPath(
+  tool: string,
+  agentDir = getAgentConfigDir(),
+): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
+  if (tool === "ask_question") return join(SUBAGENTS_DIR, "subagent-done.ts");
   // The spawning/lifecycle tools are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
   }
-  const extBase = join(getAgentConfigDir(), "extensions");
+  if (PI_WEB_ACCESS_TOOLS.has(tool)) {
+    return resolvePiWebAccessExtension(agentDir);
+  }
+  const extBase = join(agentDir, "extensions");
   const map: Record<string, string> = {
-    web_search: join(extBase, "web-search", "index.ts"),
-    web_fetch: join(extBase, "web-fetch", "index.ts"),
     video_extract: join(extBase, "video-extract", "index.ts"),
     youtube_search: join(extBase, "youtube-search", "index.ts"),
     google_image_search: join(extBase, "google-image-search", "index.ts"),
@@ -631,6 +1056,8 @@ interface RunningSubagent {
   sessionFile: string;
   /** Session entry count captured before this process was launched. */
   sessionEntryCountBefore?: number;
+  /** Finalized settled record names already accepted by the parent API. */
+  deliveredSettledRecords?: Set<string>;
   launchScriptFile?: string;
   activityFile?: string;
   activity?: SubagentActivityState;
@@ -672,7 +1099,7 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 
 /** Latest ExtensionContext from session_start, used for widget updates. */
 let latestCtx: ExtensionContext | null = null;
-/** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
+/** Latest ExtensionAPI, used to deliver live child notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
 
 /** Result delivery must schedule a fresh parent turn, never steer the active one. */
@@ -963,16 +1390,149 @@ function verifyInstalledClaudePolicy(): void {
  * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
  * responsibility since they differ slightly between launch and resume.
  */
-function resolveToolBackingExtensions(toolAllowlist: string | null): string[] | null {
+function resolveToolBackingExtensions(
+  toolAllowlist: string | null,
+  agentDir = getAgentConfigDir(),
+): string[] | null {
   if (toolAllowlist === null) return null;
   const extensionPaths = new Set<string>();
+  let piWebAccessExtension: string | undefined;
   for (const tool of toolAllowlist.split(",")) {
-    const extensionPath = getToolExtensionPath(tool);
-    if (extensionPath && existsSync(extensionPath)) {
-      extensionPaths.add(resolve(extensionPath));
+    const isPiWebAccessTool = PI_WEB_ACCESS_TOOLS.has(tool);
+    const extensionPath = isPiWebAccessTool
+      ? (piWebAccessExtension ??= resolvePiWebAccessExtension(agentDir))
+      : getToolExtensionPath(tool, agentDir);
+    if (!extensionPath) continue;
+    try {
+      const canonicalPath = realpathSync(extensionPath);
+      if (!statSync(canonicalPath).isFile()) throw new Error("not a file");
+      extensionPaths.add(canonicalPath);
+    } catch (error: any) {
+      if (isPiWebAccessTool) {
+        throw piWebAccessError(
+          `validated extension entrypoint became unavailable: ${extensionPath} ` +
+            `(${error?.message ?? String(error)})`,
+        );
+      }
+      throw new Error(
+        `Tool-backing extension is unavailable for \"${tool}\": ${extensionPath} ` +
+          `(${error?.message ?? String(error)})`,
+      );
     }
   }
   return [...extensionPaths];
+}
+
+function createToolExtensionIdentities(
+  toolExtensions: string[] | null,
+  toolAllowlist: string | null,
+  agentDir = getAgentConfigDir(),
+): ToolExtensionIdentity[] | null {
+  if (toolExtensions === null || toolAllowlist === null) return null;
+  const needsPiWebAccess = hasPiWebAccessTools(toolAllowlist);
+  const piWebAccess = needsPiWebAccess ? resolvePiWebAccessMetadata(agentDir) : undefined;
+
+  const identities = toolExtensions.map((extensionPath) => {
+    const canonicalPath = realpathSync(extensionPath);
+    if (!statSync(canonicalPath).isFile()) {
+      throw new Error(`Tool-backing extension is not a file: ${extensionPath}`);
+    }
+    const identity: ToolExtensionIdentity = {
+      path: canonicalPath,
+      sha256: sha256(readFileSync(canonicalPath)),
+    };
+    if (piWebAccess && canonicalPath === piWebAccess.extensionPath) {
+      identity.piWebAccess = piWebAccess.packageIdentity;
+    }
+    return identity;
+  });
+  if (piWebAccess && !identities.some((identity) => identity.piWebAccess)) {
+    throw piWebAccessError(
+      "the validated extension entrypoint changed while its immutable launch identity was being captured",
+    );
+  }
+  return identities;
+}
+
+function samePiWebAccessIdentity(
+  saved: PiWebAccessPackageIdentity,
+  current: PiWebAccessPackageIdentity,
+): boolean {
+  return saved.source === current.source &&
+    saved.packageRoot === current.packageRoot &&
+    saved.packageName === current.packageName &&
+    saved.packageVersion === current.packageVersion &&
+    saved.manifestSha256 === current.manifestSha256 &&
+    saved.configPath === current.configPath &&
+    saved.configState === current.configState &&
+    saved.configSha256 === current.configSha256 &&
+    saved.relevantConfigSha256 === current.relevantConfigSha256;
+}
+
+function verifySavedToolExtensions(loadout: SubagentLoadout): string | null {
+  if (loadout.toolAllowlist === null) {
+    return loadout.toolExtensions === null && loadout.toolExtensionIdentities === null
+      ? null
+      : "the unrestricted snapshot has inconsistent extension identity fields";
+  }
+  if (!loadout.toolExtensions || !loadout.toolExtensionIdentities) {
+    return "the restricted snapshot does not contain exact tool-backing extension identities";
+  }
+  if (loadout.toolExtensions.length !== loadout.toolExtensionIdentities.length) {
+    return "the saved extension path and identity counts differ";
+  }
+
+  let webToolsRequested: boolean;
+  try {
+    webToolsRequested = hasPiWebAccessTools(loadout.toolAllowlist);
+  } catch (error: any) {
+    return error?.message ?? String(error);
+  }
+  const webIdentities = loadout.toolExtensionIdentities.filter((identity) => identity.piWebAccess);
+  if (webToolsRequested !== (webIdentities.length === 1)) {
+    return "the saved pi-web-access tool request and package identity do not match";
+  }
+
+  let currentPiWebAccess: ResolvedPiWebAccess | undefined;
+  for (let index = 0; index < loadout.toolExtensions.length; index++) {
+    const savedPath = loadout.toolExtensions[index];
+    const identity = loadout.toolExtensionIdentities[index];
+    if (identity.path !== savedPath) {
+      return `saved extension identity path does not match its loadout path: ${savedPath}`;
+    }
+
+    let canonicalPath: string;
+    try {
+      canonicalPath = realpathSync(savedPath);
+      if (!statSync(canonicalPath).isFile()) throw new Error("not a file");
+    } catch (error: any) {
+      return `saved tool-backing extension is unavailable: ${savedPath} (${error?.message ?? String(error)})`;
+    }
+    if (canonicalPath !== savedPath) {
+      return `saved tool-backing extension path drifted or was replaced by a symlink: ${savedPath}`;
+    }
+    if (sha256(readFileSync(canonicalPath)) !== identity.sha256) {
+      return `saved tool-backing extension digest drifted: ${savedPath}`;
+    }
+
+    if (identity.piWebAccess) {
+      if (!loadout.agentDir) {
+        return "the pi-web-access identity has no saved effective Pi agent directory";
+      }
+      try {
+        currentPiWebAccess ??= resolvePiWebAccessMetadata(loadout.agentDir);
+      } catch (error: any) {
+        return error?.message ?? String(error);
+      }
+      if (currentPiWebAccess.extensionPath !== savedPath) {
+        return "the effective pi-web-access extension path no longer matches the saved canonical path";
+      }
+      if (!samePiWebAccessIdentity(identity.piWebAccess, currentPiWebAccess.packageIdentity)) {
+        return "the effective pi-web-access package/version/manifest or full config identity drifted";
+      }
+    }
+  }
+  return null;
 }
 
 function applySandboxToParts(
@@ -1224,7 +1784,7 @@ function handleSubagentSteer(
       type: "text" as const,
       text:
         `Message delivered to running subagent "${running.name}". It picks this up at its next ` +
-        `turn boundary. If it exits, its result still arrives as a follow-up notification.`,
+        `turn boundary. When it settles, its next result or idle report still arrives automatically.`,
     }],
     details: { id: running.id, name: running.name, status: "steered" },
   };
@@ -1236,9 +1796,24 @@ function shouldSuppressWatcherMessage(running: RunningSubagent): boolean {
   return running.killed === true;
 }
 
-function discardPendingQuestion(running: RunningSubagent): void {
+// Compatibility cleanup for stale files created by older child extensions.
+function discardLegacyQuestionArtifacts(sessionFile: string): void {
+  const directory = dirname(sessionFile);
+  const prefix = `${basename(sessionFile)}.ask`;
   try {
-    unlinkSync(`${running.sessionFile}.ask`);
+    for (const name of readdirSync(directory)) {
+      if (name === prefix || name.startsWith(`${prefix}.`)) {
+        try {
+          unlinkSync(join(directory, name));
+        } catch {}
+      }
+    }
+  } catch {}
+}
+
+function discardSettledRecords(sessionFile: string): void {
+  try {
+    rmSync(`${sessionFile}.idle`, { recursive: true, force: true });
   } catch {}
 }
 
@@ -1268,7 +1843,8 @@ function killSubagent(
   // Set this before aborting/removing anything. Any watcher completion queued
   // by the pane termination must observe it and suppress its follow-up notification.
   running.killed = true;
-  discardPendingQuestion(running);
+  discardLegacyQuestionArtifacts(running.sessionFile);
+  discardSettledRecords(running.sessionFile);
   let watcherAbortError: string | undefined;
   try {
     running.abortController?.abort();
@@ -1349,7 +1925,7 @@ function createSpawnStartedAcknowledgement(
         text:
           `Sub-agent "${running.name}" launched and is now running in the background. ` +
           `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
-          `The results will be delivered to you automatically as a follow-up notification when the sub-agent finishes. ` +
+          `When it settles, the harness will automatically deliver its final result if it exited or an idle report if it remains alive. ` +
           `Until then, move on to other work or tell the user you're waiting.`,
       },
     ],
@@ -1511,17 +2087,6 @@ function resumeConflictMessage(
         `wait for automatic result delivery or message it once the live session is registered.`;
 }
 
-function unavailableResumeExtension(loadout: SubagentLoadout): string | null {
-  if (loadout.toolAllowlist === null) return null;
-  if (loadout.toolExtensions === null) {
-    return "the restricted snapshot does not contain its exact tool-backing extensions";
-  }
-  const missing = loadout.toolExtensions.filter((extensionPath) => !existsSync(extensionPath));
-  return missing.length > 0
-    ? `saved tool-backing extension${missing.length === 1 ? " is" : "s are"} missing: ${missing.join(", ")}`
-    : null;
-}
-
 /**
  * Safely relaunch one completed, parent-scoped Pi session. Both public resume
  * entrypoints use this implementation so registry scoping, validation,
@@ -1603,13 +2168,28 @@ async function resumeRegisteredSubagent(
         { name },
       );
     }
-    const extensionError = unavailableResumeExtension(loadout);
+    const extensionError = verifySavedToolExtensions(loadout);
     if (extensionError) {
       return resumeError(
         `Cannot safely resume "${name}": ${extensionError}. ` +
           `The exact saved sandbox cannot be replayed, so no pane was created.`,
         { name },
       );
+    }
+    if (hasPiWebAccessTools(loadout.toolAllowlist)) {
+      preflightResolvedPiWebAccess({
+        cwd: loadout.cwd ?? process.cwd(),
+        agentDir: loadout.agentDir!,
+        extensionPath: findResolvedPiWebAccessExtension(loadout.toolExtensions, loadout.agentDir!),
+      });
+      const postPreflightError = verifySavedToolExtensions(loadout);
+      if (postPreflightError) {
+        return resumeError(
+          `Cannot safely resume "${name}": ${postPreflightError}. ` +
+            `The recorded package/config identity changed during capability preflight, so no pane was created.`,
+          { name },
+        );
+      }
     }
 
     const { autoExit, interactive } = resolveResumeLaunchBehavior();
@@ -1634,13 +2214,15 @@ async function resumeRegisteredSubagent(
 
     const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? name;
     const entryCountBefore = countSessionEntryLines(sessionPath);
+    // The completed process cannot publish again. Remove any records or claim
+    // markers left by an earlier watcher before the resumed process starts.
+    discardLegacyQuestionArtifacts(sessionPath);
+    discardSettledRecords(sessionPath);
     const artifactDir = parentArtifactDir;
     const activityFile = getSubagentActivityFile(artifactDir, id);
     mkdirSync(dirname(activityFile), { recursive: true });
 
     const parts = ["pi", "--session", shellEscape(sessionPath)];
-    const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-    parts.push("-e", shellEscape(subagentDonePath));
     applySandboxToParts(parts, loadout, { artifactDir, name });
 
     const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23);
@@ -1839,11 +2421,17 @@ export const __test__ = {
   claudePolicyHelpError,
   applyClaudeToolPolicy,
   resolveToolBackingExtensions,
+  createToolExtensionIdentities,
+  verifySavedToolExtensions,
   applySandboxToParts,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
+  resolvePiWebAccess: resolvePiWebAccessMetadata,
+  resolvePiWebAccessExtension,
+  preflightPiWebAccessCapabilities,
+  preflightResolvedPiWebAccess,
   resolveRunningByName,
   uniqueRunningName,
   reserveSpawnName,
@@ -1855,7 +2443,7 @@ export const __test__ = {
   handleSubagentKill,
   shouldSuppressWatcherMessage,
   createSpawnStartedAcknowledgement,
-  deliverPendingQuestion,
+  deliverPendingSettled,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   reserveCompletedResume,
@@ -1969,6 +2557,10 @@ async function launchSubagent(
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  // A non-empty subagent_agents list is the sole gate for lifecycle tools.
+  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const targetCwdForSession = effectiveCwd ?? ctx.cwd;
 
   let claudeToolPolicy: { tools: string[] } | null = null;
   if (agentDefs?.cli === "claude") {
@@ -1978,13 +2570,33 @@ async function launchSubagent(
     claudeToolPolicy = policy;
   }
 
+  // Resolve every Pi-backed extension before creating a terminal surface. In
+  // particular, a missing or invalid pi-web-access package must fail closed
+  // without leaving behind a pane or a partially written saved loadout.
+  const toolAllowlist =
+    agentDefs?.cli === "claude"
+      ? null
+      : buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+  const toolExtensions = agentDefs?.cli === "claude"
+    ? null
+    : resolveToolBackingExtensions(toolAllowlist, effectiveAgentDir);
+  if (hasPiWebAccessTools(toolAllowlist)) {
+    preflightResolvedPiWebAccess({
+      cwd: targetCwdForSession,
+      agentDir: effectiveAgentDir,
+      extensionPath: findResolvedPiWebAccessExtension(toolExtensions, effectiveAgentDir),
+    });
+  }
+  // Record the validated entrypoint/package/config identity after the fresh probe.
+  const toolExtensionIdentities = agentDefs?.cli === "claude"
+    ? null
+    : createToolExtensionIdentities(toolExtensions, toolAllowlist, effectiveAgentDir);
+
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
-  const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
   // Generate a deterministic session file path for this subagent.
@@ -2037,9 +2649,6 @@ async function launchSubagent(
   const summaryInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
-  // An agent with a non-empty subagent_agents list is granted the spawning
-  // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
-  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
   const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -2129,20 +2738,10 @@ async function launchSubagent(
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
-  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
-
   // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
   // else the propagated global dir. Captured once so the launch env and the
   // resume snapshot agree.
   const resolvedAgentDir = effectiveAgentDir;
-
-  // Default-deny model: named profiles always get an allowlist (including the
-  // child control tool when `tools` is omitted), so global extension discovery
-  // is disabled and only extensions backing whitelisted tools are re-enabled.
-  // A null allowlist is retained only when replaying a legacy unrestricted
-  // loadout snapshot.
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
 
   // Snapshot the fully-resolved sandbox beside the session file so explicit
   // subagent_resume (and subagent_message's compatibility path) can replay the
@@ -2150,7 +2749,8 @@ async function launchSubagent(
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
-    toolExtensions: resolveToolBackingExtensions(toolAllowlist),
+    toolExtensions,
+    toolExtensionIdentities,
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
@@ -2303,46 +2903,113 @@ function copyClaudeSession(sentinelFile: string): string | null {
 }
 
 /**
- * Detect an `ask_question` signal from a still-running subagent and notify the
- * orchestrator without ending the subagent. Each subagent has its own
- * `${sessionFile}.ask` file and its own watcher, so parallel questions from
- * multiple subagents are delivered independently. The file is deleted after
- * delivery so it fires once per question (a subagent may ask again later).
+ * Deliver all accumulated immutable settled snapshots in one ordered parent
+ * turn. Atomic publication hides partial files; corrupt finalized records are
+ * retired independently. The whole valid batch remains when sendMessage throws.
  */
-function deliverPendingQuestion(running: RunningSubagent): void {
-  if (running.killed) return;
-  const askFile = `${running.sessionFile}.ask`;
-  let payload: any = null;
+function deliverPendingSettled(running: RunningSubagent): void {
+  if (running.killed || !latestPi) return;
+  const directory = `${running.sessionFile}.idle`;
+  let recordNames: string[];
   try {
-    if (!existsSync(askFile)) return;
-    payload = JSON.parse(readFileSync(askFile, "utf-8"));
+    recordNames = readdirSync(directory).filter((name) => name.endsWith(".json")).sort();
   } catch {
-    // Malformed/partway-written file — drop it and move on.
+    return;
   }
-  try {
-    unlinkSync(askFile);
-  } catch {}
-  if (running.killed || !payload?.question) return;
 
-  const name = running.name; // unique per session (deduped at spawn) — targets the reply
-  const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
+  const delivered = running.deliveredSettledRecords ??= new Set<string>();
+  const remove = (path: string): boolean => {
+    try {
+      unlinkSync(path);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  recordNames = recordNames.filter((name) => {
+    if (!delivered.has(name)) return true;
+    if (remove(join(directory, name))) delivered.delete(name);
+    return false;
+  });
+
+  const records: Array<{ name: string; payload: Record<string, unknown> }> = [];
+  for (const name of recordNames) {
+    const path = join(directory, name);
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    } catch {
+      remove(path);
+      continue;
+    }
+    const state = String(payload.state);
+    if (
+      payload.type !== "settled" ||
+      !["idle", "awaiting_answer", "waiting_on_children"].includes(state) ||
+      (state === "awaiting_answer" &&
+        (typeof payload.question !== "string" || !payload.question.trim()))
+    ) {
+      remove(path);
+      continue;
+    }
+    records.push({ name, payload });
+  }
+  if (records.length === 0 || running.killed) return;
+
+  const newest = records.at(-1)!.payload;
+  const state = String(newest.state);
+  const response = typeof newest.response === "string" && newest.response.trim()
+    ? newest.response
+    : null;
+  const question = state === "awaiting_answer"
+    ? (newest.question as string).trim()
+    : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
-  const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
+  const stateLabel = state === "awaiting_answer"
+    ? "awaiting an answer"
+    : state === "waiting_on_children" ? "waiting on child sub-agents" : "idle";
+  const history = records.length > 1
+    ? `\n\nSettled states (oldest → newest): ${records.map(({ payload }) =>
+      payload.state === "awaiting_answer" ? `awaiting_answer (${payload.question})` : payload.state
+    ).join(" → ")}.`
+    : "";
+  const responseText = response ? `\n\nLatest assistant response:\n\n${response}` : "";
+  const replyText = question
+    ? `\n\nQuestion:\n\n${question}\n\nReply with subagent_message({ name: "${running.name}", message: "…" }).`
+    : `\n\nContinue it with subagent_message({ name: "${running.name}", message: "…" }) ` +
+      "or interact with its pane directly.";
 
-  latestPi?.sendMessage(
-    {
-      customType: "subagent_question",
-      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
-      display: true,
-      details: {
-        name,
-        agent: running.agent,
-        question: payload.question,
-        ...(sessionId ? { sessionId } : {}),
+  try {
+    latestPi.sendMessage(
+      {
+        customType: state === "awaiting_answer" ? "subagent_question" : "subagent_idle",
+        content:
+          `Sub-agent "${running.name}" is ${stateLabel} and still running ` +
+          `(${formatElapsed(elapsed)}).${history}${responseText}${replyText}`,
+        display: true,
+        details: {
+          name: running.name,
+          agent: running.agent,
+          status: state,
+          running: true,
+          elapsed,
+          sessionFile: running.sessionFile,
+          settledCount: records.length,
+          states: records.map(({ payload }) => payload.state),
+          ...(response ? { response } : {}),
+          ...(question ? { question } : {}),
+        },
       },
-    },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  } catch {
+    return;
+  }
+
+  for (const { name } of records) delivered.add(name);
+  for (const { name } of records) {
+    if (remove(join(directory, name))) delivered.delete(name);
+  }
 }
 
 async function watchSubagent(
@@ -2362,11 +3029,12 @@ async function watchSubagent(
         if (pollSignal.aborted || running.killed) return;
         observeRunningSubagent(running);
         if (pollSignal.aborted || running.killed) return;
-        deliverPendingQuestion(running);
+        deliverPendingSettled(running);
       },
     });
 
-    discardPendingQuestion(running);
+    discardLegacyQuestionArtifacts(running.sessionFile);
+    discardSettledRecords(running.sessionFile);
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     naturalTerminalProven = result.reason !== "disappeared";
 
@@ -2520,7 +3188,8 @@ async function watchSubagent(
       terminalProof: "natural",
     };
   } catch (err: any) {
-    discardPendingQuestion(running);
+    discardLegacyQuestionArtifacts(running.sessionFile);
+    discardSettledRecords(running.sessionFile);
     let terminationConfirmed = running.killed === true;
     if (!running.killed) {
       try {
@@ -2615,17 +3284,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a follow-up notification that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
+        "When a Pi-backed child fully settles, the harness AUTOMATICALLY reports either its final result after exit or that it is idle and still running — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result or idle report when it is ready.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a follow-up notification that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
+        "When a Pi-backed child fully settles, the harness AUTOMATICALLY reports either its final result after exit or that it is idle and still running — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result or idle report when it is ready.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

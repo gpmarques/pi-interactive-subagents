@@ -7,10 +7,13 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
+  readdirSync,
   rmSync,
   writeFileSync,
+  symlinkSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
@@ -114,15 +117,55 @@ describe("hermetic safe subagent resume", () => {
     return sessionFile;
   }
 
+  function installPiWebAccessFixture(): {
+    entrypoint: string;
+    manifest: string;
+    config: string;
+    agentDir: string;
+  } {
+    const agentDir = join(root, "saved-agent-dir");
+    const packageRoot = join(agentDir, "npm", "node_modules", "pi-web-access");
+    const entrypoint = join(packageRoot, "index.ts");
+    const manifest = join(packageRoot, "package.json");
+    const config = join(agentDir, "web-search.json");
+    rmSync(packageRoot, { recursive: true, force: true });
+    mkdirSync(packageRoot, { recursive: true });
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:pi-web-access"] }));
+    writeFileSync(entrypoint, [
+      "const names = [\"web_search\", \"fetch_content\", \"get_search_content\", \"source_check\"];",
+      "export default function (pi) {",
+      "  for (const name of names) pi.registerTool({",
+      "    name, label: name, description: name,",
+      '    parameters: { type: "object", properties: {} },',
+      '    async execute() { return { content: [{ type: "text", text: "unused" }] }; },',
+      "  });",
+      "}",
+      "",
+    ].join("\n"));
+    writeFileSync(manifest, JSON.stringify({
+      name: "pi-web-access",
+      version: "0.27.0",
+      pi: { extensions: ["./index.ts"] },
+    }));
+    writeFileSync(config, "{}\n");
+    return {
+      entrypoint: realpathSync(entrypoint),
+      manifest: realpathSync(manifest),
+      config: realpathSync(config),
+      agentDir: realpathSync(agentDir),
+    };
+  }
+
   function baseLoadout(overrides: Partial<SubagentLoadout> = {}): SubagentLoadout {
     const cwd = join(root, "saved-cwd");
     const agentDir = join(root, "saved-agent-dir");
     mkdirSync(cwd, { recursive: true });
     mkdirSync(agentDir, { recursive: true });
-    return {
+    const loadout: SubagentLoadout = {
       agent: "worker",
       toolAllowlist: "read,write",
       toolExtensions: [backingExtension],
+      toolExtensionIdentities: [],
       model: "openai-codex/gpt-5.6-sol",
       thinking: "xhigh",
       systemPromptMode: "append",
@@ -133,6 +176,17 @@ describe("hermetic safe subagent resume", () => {
       agentDir,
       ...overrides,
     };
+    if (overrides.toolExtensionIdentities === undefined) {
+      loadout.toolExtensionIdentities = testApi.createToolExtensionIdentities(
+        loadout.toolExtensions,
+        loadout.toolAllowlist,
+        agentDir,
+      );
+      loadout.toolExtensions = loadout.toolExtensionIdentities?.map(
+        (identity: { path: string }) => identity.path,
+      ) ?? null;
+    }
+    return loadout;
   }
 
   function splitCount(): number {
@@ -196,6 +250,7 @@ describe("hermetic safe subagent resume", () => {
     );
     mkdirSync(binDir, { recursive: true });
     writeFileSync(backingExtension, "export default () => {};\n");
+    backingExtension = realpathSync(backingExtension);
     writeFileSync(tmuxCounter, "0\n");
     writeFileSync(
       join(binDir, "tmux"),
@@ -306,6 +361,15 @@ describe("hermetic safe subagent resume", () => {
   it("resumes only a valid current-parent name and retains its reusable mapping", async () => {
     const sessionFile = createChild("safe-name");
     writeSubagentLoadout(sessionFile, baseLoadout());
+    mkdirSync(`${sessionFile}.idle`);
+    writeFileSync(
+      join(`${sessionFile}.idle`, "00000001.json"),
+      JSON.stringify({ type: "settled", state: "idle", response: "STALE_PRE_RESUME_IDLE" }),
+    );
+    writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "Legacy stale question" }));
+    const idleCountBefore = sentMessages.filter(
+      ({ message }) => message.customType === "subagent_idle",
+    ).length;
     const started = await resumeTool.execute(
       "resume-valid",
       { name: "safe-name", message: "Continue with the safe follow-up." },
@@ -316,6 +380,21 @@ describe("hermetic safe subagent resume", () => {
     assert.equal(started.details.status, "started");
     assert.equal(started.details.sessionFile, sessionFile);
     assert.equal(resolveNameInRegistry(artifactDir(), "safe-name")?.runState, "running");
+    assert.deepEqual(
+      readdirSync(dirname(sessionFile)).filter((name) =>
+        name.startsWith(`${basename(sessionFile)}.ask`)
+      ),
+      [],
+      "resume discards legacy question artifacts",
+    );
+    const running = runningMap.get(started.details.id);
+    assert.ok(running);
+    testApi.deliverPendingSettled(running);
+    assert.equal(
+      sentMessages.filter(({ message }) => message.customType === "subagent_idle").length,
+      idleCountBefore,
+      "resume must discard settled records from an earlier process",
+    );
 
     const delivered = await completeRun(started, "CURRENT_RESUMED_RESULT");
     assert.match(delivered.content, /CURRENT_RESUMED_RESULT/);
@@ -566,7 +645,13 @@ describe("hermetic safe subagent resume", () => {
       ["incomplete-loadout", JSON.stringify({ toolAllowlist: "read" })],
       [
         "missing-extension",
-        JSON.stringify(baseLoadout({ toolExtensions: [join(root, "gone-extension.ts")] })),
+        JSON.stringify(baseLoadout({
+          toolExtensions: [join(root, "gone-extension.ts")],
+          toolExtensionIdentities: [{
+            path: join(root, "gone-extension.ts"),
+            sha256: "0".repeat(64),
+          }],
+        })),
       ],
     ] as const;
     const before = splitCount();
@@ -585,6 +670,109 @@ describe("hermetic safe subagent resume", () => {
       assert.equal(testApi.reservedResumeSessions.size, 0, `${name} must release its session reservation`);
     }
     assert.equal(splitCount(), before, "invalid loadouts must fail before surface creation");
+  });
+
+  it("refuses extension byte drift and symlink replacement before pane creation", async () => {
+    const digestSession = createChild("digest-drift");
+    writeSubagentLoadout(digestSession, baseLoadout());
+    writeFileSync(backingExtension, "export default function changed() {};\n");
+    const beforeDigest = splitCount();
+    const digestResult = await resumeTool.execute(
+      "resume-digest-drift",
+      { name: "digest-drift", message: "Do not replay changed bytes." },
+      undefined,
+      undefined,
+      context(),
+    );
+    assert.match(digestResult.details.error, /digest drifted/i);
+    assert.equal(splitCount(), beforeDigest);
+    writeFileSync(backingExtension, "export default () => {};\n");
+
+    const symlinkSession = createChild("symlink-replacement");
+    writeSubagentLoadout(symlinkSession, baseLoadout());
+    const replacement = join(root, "replacement-extension.ts");
+    writeFileSync(replacement, "export default () => {};\n");
+    rmSync(backingExtension);
+    symlinkSync(replacement, backingExtension);
+    const beforeSymlink = splitCount();
+    const symlinkResult = await resumeTool.execute(
+      "resume-symlink-replacement",
+      { name: "symlink-replacement", message: "Do not follow a replacement symlink." },
+      undefined,
+      undefined,
+      context(),
+    );
+    assert.match(symlinkResult.details.error, /path drifted|replaced by a symlink/i);
+    assert.equal(splitCount(), beforeSymlink);
+    rmSync(backingExtension);
+    writeFileSync(backingExtension, "export default () => {};\n");
+  });
+
+  it("refuses pi-web-access manifest and relevant config drift before pane creation", async () => {
+    const splitsBefore = splitCount();
+    const installed = installPiWebAccessFixture();
+    const webLoadout = () => baseLoadout({
+      toolAllowlist: "read,web_search,fetch_content,get_search_content,source_check",
+      toolExtensions: [installed.entrypoint],
+      agentDir: installed.agentDir,
+    });
+
+    const manifestSession = createChild("manifest-drift");
+    writeSubagentLoadout(manifestSession, webLoadout());
+    writeFileSync(installed.manifest, JSON.stringify({
+      name: "pi-web-access",
+      version: "0.27.0",
+      pi: { extensions: ["./index.ts"] },
+      changedAfterSnapshot: true,
+    }));
+    const manifestRejected = await resumeTool.execute(
+      "resume-manifest-drift",
+      { name: "manifest-drift", message: "Continue." },
+      undefined,
+      undefined,
+      context(),
+    );
+    assert.match(manifestRejected.content[0].text, /package\/version\/manifest or full config identity drifted/i);
+    assert.equal(splitCount(), splitsBefore);
+    assert.equal(runningMap.size, 0);
+
+    // Restore package bytes before taking a distinct config-bound snapshot.
+    installPiWebAccessFixture();
+    const configSession = createChild("config-drift");
+    writeSubagentLoadout(configSession, webLoadout());
+    writeFileSync(installed.config, JSON.stringify({ webSearch: { enabled: true } }));
+    const configRejected = await resumeTool.execute(
+      "resume-config-drift",
+      { name: "config-drift", message: "Continue." },
+      undefined,
+      undefined,
+      context(),
+    );
+    assert.match(configRejected.content[0].text, /package\/version\/manifest or full config identity drifted/i);
+    assert.equal(splitCount(), splitsBefore);
+    assert.equal(runningMap.size, 0);
+  });
+
+  it("resumes an unchanged researcher identity only after the fresh capability preflight", async () => {
+    const installed = installPiWebAccessFixture();
+    const sessionFile = createChild("unchanged-web-identity");
+    writeSubagentLoadout(sessionFile, baseLoadout({
+      agent: "researcher",
+      toolAllowlist: "web_search,fetch_content,get_search_content,source_check,ask_question",
+      toolExtensions: [installed.entrypoint],
+      agentDir: installed.agentDir,
+    }));
+    const before = splitCount();
+    const result = await resumeTool.execute(
+      "resume-unchanged-web-identity",
+      { name: "unchanged-web-identity", message: "Resume unchanged researcher." },
+      undefined,
+      undefined,
+      context(),
+    );
+    assert.equal(result.details.status, "started", JSON.stringify(result));
+    assert.equal(splitCount(), before + 1);
+    suppressRunning();
   });
 
   it("replays the exact saved model, identity, cwd, agent dir, tools, extensions, and autonomous behavior", async () => {
@@ -665,24 +853,27 @@ describe("hermetic safe subagent resume", () => {
     assert.doesNotMatch(nestedScript, /PI_SUBAGENT_LIFECYCLE_DISABLED=1/);
   });
 
-  it("preserves complete legacy null-allowlist replay without restoring lifecycle tools", async () => {
+  it("rejects legacy loadouts without immutable extension identity before pane creation", async () => {
     const sessionFile = createChild("legacy-null");
-    const legacy = baseLoadout({ toolAllowlist: null, toolExtensions: null, spawnable: null });
-    const { toolExtensions: _omittedLegacyField, ...legacySidecar } = legacy;
+    const legacy = baseLoadout({
+      toolAllowlist: null,
+      toolExtensions: null,
+      toolExtensionIdentities: null,
+      spawnable: null,
+    });
+    const { toolExtensionIdentities: _omittedIdentity, ...legacySidecar } = legacy;
     writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(legacySidecar));
+    const before = splitCount();
 
-    const started = await resumeTool.execute(
+    const result = await resumeTool.execute(
       "resume-legacy-null",
-      { name: "legacy-null", message: "Continue the complete legacy session." },
+      { name: "legacy-null", message: "Do not replay a legacy identity." },
       undefined,
       undefined,
       context(),
     );
-    const script = readFileSync(started.details.launchScriptFile, "utf8");
-    assert.equal(started.details.status, "started");
-    assert.doesNotMatch(script, /--no-extensions|--tools/);
-    assert.match(script, /PI_SUBAGENT_LIFECYCLE_DISABLED=1/);
-    assert.match(script, /-u PI_SUBAGENT_ALLOWED/);
+    assert.match(result.details.error, /Cannot safely resume/);
+    assert.equal(splitCount(), before);
   });
 
   it("deduplicates concurrent explicit-resume/message attempts by mapped session before the first await", async () => {

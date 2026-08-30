@@ -3,19 +3,21 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+Alt+O)
  * - Provides an `ask_question` tool for asking the parent orchestrator a question
  *
- * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
- * automatically when their agent loop ends (see the `agent_end` handler);
- * interactive agents end when the human exits the pane.
+ * Subagents do NOT self-terminate via a tool. Auto-exit agents request shutdown
+ * when their agent loop ends; interactive agents end when the human exits the
+ * pane. A process that remains alive publishes one immutable settled record
+ * from every `agent_settled`, after retries, compaction, and continuations.
  *
- * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
- * signal the parent's watcher picks up, parks the session in a "waiting" state
- * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
- * replies with subagent_message — which lands as the subagent's next turn.
+ * `ask_question` keeps the session open by recording the pending question in
+ * the next settled record. The parent replies through subagent_message, whose
+ * external `input` event clears the pending question for later settled records.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -110,6 +112,59 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/** Latest non-empty assistant text in a low-level run, without classifying it. */
+export function findLatestAssistantResponse(messages: any[] | undefined): string | null {
+  if (!messages) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+    const text = message.content
+      .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+      .map((part: any) => part.text)
+      .join("\n")
+      .trim();
+    if (text) return text;
+  }
+  return null;
+}
+
+const SETTLED_SEQUENCE = Symbol.for(
+  "pi-interactive-subagents/settled-record-sequence/v1",
+);
+
+function nextSettledRecordSequence(): string {
+  const globals = globalThis as any;
+  const stored = globals[SETTLED_SEQUENCE];
+  const current = typeof stored === "bigint" ? stored : 0n;
+  globals[SETTLED_SEQUENCE] = current + 1n;
+  // Twenty decimal digits preserve lexical order for far beyond any practical
+  // process lifetime. The process-global survives extension module reloads and
+  // safely provides one monotonic epoch across all child sessions in-process.
+  return current.toString().padStart(20, "0");
+}
+
+/** Atomically expose one complete settled-cycle record to the parent watcher. */
+function publishSettledRecord(sessionFile: string, payload: Record<string, unknown>): void {
+  const directory = `${sessionFile}.idle`;
+  mkdirSync(directory, { recursive: true });
+  // Sequence leads the filename so lexical order is monotonic across both wall
+  // clock rollback and extension reload. A new process starts from zero only
+  // after launch/resume cleanup emptied that process epoch's session queue.
+  const sequence = nextSettledRecordSequence();
+  const basename = `${sequence}-${process.pid}-${randomUUID()}`;
+  const temporaryPath = join(directory, `.${basename}.tmp`);
+  const publishedPath = join(directory, `${basename}.json`);
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(payload), "utf8");
+    renameSync(temporaryPath, publishedPath);
+  } catch (error) {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {}
+    throw error;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -178,11 +233,11 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
-  // Set when ask_question is called; suppresses auto-exit so the session stays
-  // open while it waits for the orchestrator's reply. Cleared when the reply
-  // lands — on `input` (covers a reply steered into the current run) and on
-  // `agent_start` (covers a reply that starts a fresh turn after parking).
-  let awaitingAnswer = false;
+  // Only external input clears a pending question. agent_start can also mean
+  // retry, compaction recovery, or continuation and is not evidence of a reply.
+  let pendingQuestion: string | null = null;
+  let shutdownRequested = false;
+  let latestAssistantResponse: string | null = null;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -196,15 +251,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", () => {
     recorder.input();
-    // A submitted message is the orchestrator's (or a human's) reply — the
-    // pending ask_question has been answered, however it was delivered. Clear
-    // here, not only on agent_start, because a reply steered in *mid-run* is
-    // absorbed into the current run (pi's `steer` behavior injects it before
-    // the next LLM call): no new agent_start fires, so without this the flag
-    // would stay set and agent_end would park the session as `waiting` even
-    // though the answer already arrived and was consumed. (The `input` event
-    // fires for mid-run steers because prompt() emits it before queueing.)
-    awaitingAnswer = false;
+    // Pane input and subagent_message steering both cross this authoritative
+    // reply/supersession boundary. Historical settled records remain immutable;
+    // a later settlement communicates the resulting current state.
+    pendingQuestion = null;
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
@@ -217,16 +267,17 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
-    // A new turn is starting — any pending ask_question has now been answered
-    // (or superseded), so let auto-exit resume normally when this turn ends.
-    awaitingAnswer = false;
+    // Do not clear pendingQuestion here. Pi emits agent_start for automatic
+    // retries, compaction recovery, and queued continuations without input.
     recorder.agentStart();
   });
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
+    latestAssistantResponse =
+      findLatestAssistantResponse(messages) ?? latestAssistantResponse;
     // Never shut down while this session still has work in flight:
-    //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
+    //  - pendingQuestion: ask_question is waiting for the orchestrator's reply.
     //  - runningChildrenCount(): this subagent spawned its own children and is
     //    waiting for their results (delivered as steered turns). Exiting now
     //    would strand those children and drop their results.
@@ -234,7 +285,7 @@ export default function (pi: ExtensionAPI) {
     // turn lands.
     const hasPendingChildren = runningChildrenCount() > 0;
     const shouldExit =
-      !awaitingAnswer &&
+      pendingQuestion === null &&
       !hasPendingChildren &&
       autoExit &&
       shouldAutoExitOnAgentEnd(userTookOver, messages);
@@ -265,15 +316,43 @@ export default function (pi: ExtensionAPI) {
 
       recorder.agentEndDone();
       ctx.shutdown();
+      // Only suppress settled-idle after shutdown was accepted. If another
+      // extension rejects shutdown, a later agent_settled must still wake the parent.
+      shutdownRequested = true;
       return;
     }
 
-    recorder.agentEndWaiting();
     if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
+  });
+
+  pi.on("agent_settled", () => {
+    // Requested graceful shutdown produces the terminal result through the
+    // existing watcher path. Every other settlement publishes exactly one
+    // immutable snapshot; no parent-delivery race can change its meaning.
+    if (shutdownRequested) return;
+
+    recorder.agentSettledWaiting();
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (!sessionFile) return;
+    const hasPendingChildren = runningChildrenCount() > 0;
+    const state = pendingQuestion !== null
+      ? "awaiting_answer"
+      : hasPendingChildren
+      ? "waiting_on_children"
+      : "idle";
+    publishSettledRecord(sessionFile, {
+      type: "settled",
+      state,
+      name: process.env.PI_SUBAGENT_NAME ?? "subagent",
+      agent: process.env.PI_SUBAGENT_AGENT ?? "",
+      settledAt: Date.now(),
+      ...(latestAssistantResponse ? { response: latestAssistantResponse } : {}),
+      ...(pendingQuestion !== null ? { question: pendingQuestion } : {}),
+    });
   });
 
   pi.on("turn_start", (event) => {
@@ -350,6 +429,8 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       question: Type.String({
+        minLength: 1,
+        pattern: "\\S",
         description:
           "The single freeform question to ask the orchestrator. Include enough context to answer it directly.",
       }),
@@ -363,17 +444,13 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      // Keep the session open: suppress auto-exit for this turn and park in the
-      // "waiting" phase. The parent's watcher picks up the `.ask` signal and
-      // notifies the orchestrator, who replies via subagent_message.
-      awaitingAnswer = true;
+      const question = params.question.trim();
+      if (!question) throw new Error("ask_question requires a non-empty question.");
+
+      // Keep the session open. The next agent_settled snapshot carries this
+      // question to the parent; no separate mutable delivery protocol exists.
+      pendingQuestion = question;
       recorder.askQuestion();
-      const askData = {
-        name: process.env.PI_SUBAGENT_NAME ?? "subagent",
-        agent: process.env.PI_SUBAGENT_AGENT ?? "",
-        question: params.question,
-      };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
 
       return {
         content: [
@@ -384,7 +461,7 @@ export default function (pi: ExtensionAPI) {
               "assume an answer. Their reply will arrive as your next message.",
           },
         ],
-        details: { question: params.question },
+        details: { question },
       };
     },
 

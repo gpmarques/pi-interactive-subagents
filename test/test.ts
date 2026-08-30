@@ -1,7 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync, realpathSync, symlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -83,6 +83,41 @@ function withTempDir(run: (dir: string) => void) {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+function writeSettledRecord(
+  sessionFile: string,
+  payload: Record<string, unknown> | string,
+  name: string,
+): void {
+  const directory = `${sessionFile}.idle`;
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(
+    join(directory, name),
+    typeof payload === "string" ? payload : JSON.stringify(payload),
+    "utf8",
+  );
+}
+
+function readSettledRecords(sessionFile: string): Array<Record<string, unknown>> {
+  return readdirSync(`${sessionFile}.idle`)
+    .filter((name) => name.endsWith(".json"))
+    .sort()
+    .map((name) => JSON.parse(readFileSync(join(`${sessionFile}.idle`, name), "utf8")));
+}
+
+function settledRunning(sessionFile: string, id: string) {
+  return {
+    id,
+    name: "Planner",
+    agent: "planner",
+    task: "Plan",
+    surface: `%${id}`,
+    startTime: Date.now(),
+    sessionFile,
+    interactive: true,
+    statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+  };
 }
 
 function seedRegistryRun(
@@ -172,6 +207,45 @@ function writeAgentFile(
 ) {
   mkdirSync(agentsDir, { recursive: true });
   writeFileSync(join(agentsDir, `${name}.md`), `---\n${frontmatter}\n---\n\n${body}\n`);
+}
+
+function fakeExtensionIdentities(paths: string[]) {
+  return paths.map((path, index) => ({
+    path,
+    sha256: String(index + 1).repeat(64).slice(0, 64),
+  }));
+}
+
+function writePiSettings(agentDir: string, packages: unknown[] = ["npm:pi-web-access"]): void {
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages }));
+}
+
+function writePiWebAccessPackage(
+  packageRoot: string,
+  options: {
+    name?: string;
+    version?: string;
+    extensions?: unknown[];
+    entrypoint?: string;
+    entrypointSource?: string;
+  } = {},
+): string {
+  const entrypoint = options.entrypoint ?? "./runtime/web-tools.ts";
+  const entrypointPath = join(packageRoot, entrypoint);
+  const packageName = options.name ?? "pi-web-access";
+  const packageVersion = options.version ?? "0.27.0";
+  mkdirSync(dirname(entrypointPath), { recursive: true });
+  writeFileSync(entrypointPath, options.entrypointSource ?? "export default () => {};\n");
+  writeFileSync(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: packageName,
+      version: packageVersion,
+      pi: { extensions: options.extensions ?? [entrypoint] },
+    }),
+  );
+  return entrypointPath;
 }
 
 async function withIsolatedAgentEnv(
@@ -357,6 +431,10 @@ describe("session.ts", () => {
       agent: "worker",
       toolAllowlist: "read,write,edit,safe_bash,web_search,subagent,ask_question",
       toolExtensions: ["/extensions/safe-bash.ts", "/extensions/web-search.ts"],
+      toolExtensionIdentities: fakeExtensionIdentities([
+        "/extensions/safe-bash.ts",
+        "/extensions/web-search.ts",
+      ]),
       model: "openrouter/z-ai/glm-5.2",
       thinking: "medium",
       systemPromptMode: "append",
@@ -410,6 +488,7 @@ describe("session.ts", () => {
         ...sample,
         toolAllowlist: null,
         toolExtensions: null,
+        toolExtensionIdentities: null,
         spawnable: null,
       };
       for (const field of Object.keys(unrestricted).filter((field) => field !== "toolExtensions")) {
@@ -466,12 +545,17 @@ describe("session.ts", () => {
       });
     });
 
-    it("preserves an explicit legacy null allowlist as intentionally unrestricted", () => {
+    it("rejects legacy unrestricted snapshots without extension identity fields", () => {
       const sf = join(dir, "legacy-unrestricted.jsonl");
-      const unrestricted = { ...sample, toolAllowlist: null, spawnable: null };
-      delete (unrestricted as Partial<SubagentLoadout>).toolExtensions;
+      const unrestricted: Record<string, unknown> = {
+        ...sample,
+        toolAllowlist: null,
+        toolExtensions: null,
+        spawnable: null,
+      };
+      delete unrestricted.toolExtensionIdentities;
       writeFileSync(loadoutSidecarPath(sf), JSON.stringify(unrestricted), "utf8");
-      assert.deepEqual(readSubagentLoadout(sf), { ...unrestricted, toolExtensions: null });
+      assert.equal(readSubagentLoadout(sf), null);
     });
 
     it("strips lifecycle tools unless spawnable is a valid non-empty string array", () => {
@@ -483,6 +567,7 @@ describe("session.ts", () => {
           ...sample,
           toolAllowlist: lifecycle,
           toolExtensions: [],
+          toolExtensionIdentities: [],
           spawnable: null,
         }),
         "utf8",
@@ -499,6 +584,7 @@ describe("session.ts", () => {
           ...sample,
           toolAllowlist: lifecycle,
           toolExtensions: ["/extensions/subagents.ts"],
+          toolExtensionIdentities: fakeExtensionIdentities(["/extensions/subagents.ts"]),
           spawnable: [" scout ", "researcher"],
         }),
         "utf8",
@@ -1625,6 +1711,12 @@ describe("subagent discovery", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
     assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
+    assert.deepEqual(worker.tools?.split(",").map((tool: string) => tool.trim()), [
+      "read",
+      "write",
+      "edit",
+      "bash",
+    ]);
 
     const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
     assert.ok(allowlist, "expected an allowlist");
@@ -1635,6 +1727,32 @@ describe("subagent discovery", () => {
     assert.ok(tools.has("bash"), "expected worker to keep bash");
   });
 
+  it("grants all pi-web-access tools only to the bundled researcher", () => {
+    const webTools = ["web_search", "fetch_content", "get_search_content", "source_check"];
+    const researcher = testApi.loadAgentDefaults("researcher");
+    assert.ok(researcher, "expected bundled researcher to be discoverable");
+    assert.deepEqual(researcher.tools?.split(",").map((tool: string) => tool.trim()), [
+      ...webTools,
+      "safe_bash",
+    ]);
+    assert.deepEqual(
+      testApi.buildSubagentToolAllowlist(researcher.tools)?.split(","),
+      [...webTools, "safe_bash", "ask_question"],
+      "researcher should receive exactly its five profile tools plus normal question support",
+    );
+
+    for (const name of ["planner", "reviewer", "scout", "visual-tester", "worker"]) {
+      const profile = testApi.loadAgentDefaults(name);
+      assert.ok(profile, `expected bundled ${name} to be discoverable`);
+      const requested = new Set(
+        (profile.tools ?? "").split(",").map((tool: string) => tool.trim()).filter(Boolean),
+      );
+      for (const tool of webTools) {
+        assert.equal(requested.has(tool), false, `${name} must not request web tool ${tool}`);
+      }
+    }
+  });
+
   it("scout and researcher are not granted spawning tools", () => {
     for (const name of ["scout", "researcher"]) {
       const defs = testApi.loadAgentDefaults(name);
@@ -1643,18 +1761,37 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps available custom tools and skips built-ins", () => {
+  it("resolves and deduplicates all four web tools through pi-web-access's manifest", () => {
     withTempDir((dir) => {
       const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
-      const webSearchDir = join(dir, "extensions", "web-search");
-      mkdirSync(webSearchDir, { recursive: true });
-      writeFileSync(join(webSearchDir, "index.ts"), "export default () => {};\n");
-      process.env.PI_CODING_AGENT_DIR = dir;
+      const previousPackageDir = process.env.PI_PACKAGE_DIR;
+      const agentDir = join(dir, "agent");
+      const packageRoot = join(agentDir, "npm", "node_modules", "pi-web-access");
+      writePiSettings(agentDir);
+      const entrypoint = writePiWebAccessPackage(packageRoot, {
+        entrypoint: "./runtime/nonstandard-entry.ts",
+      });
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      process.env.PI_PACKAGE_DIR = join(dir, "isolated-pi-package");
 
       try {
         assert.equal(testApi.getToolExtensionPath("read"), undefined);
         assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-        assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+        const canonicalEntrypoint = realpathSync(entrypoint);
+        for (const tool of [
+          "web_search",
+          "fetch_content",
+          "get_search_content",
+          "source_check",
+        ]) {
+          assert.equal(testApi.getToolExtensionPath(tool), canonicalEntrypoint);
+        }
+        assert.deepEqual(
+          testApi.resolveToolBackingExtensions(
+            "web_search,fetch_content,get_search_content,source_check",
+          ),
+          [canonicalEntrypoint],
+        );
         assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
         // Spawning tools are registered by this extension itself.
         assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
@@ -1662,7 +1799,409 @@ describe("subagent discovery", () => {
         assert.ok(testApi.getToolExtensionPath("subagent_kill")?.endsWith("index.ts"));
       } finally {
         restoreEnvVar("PI_CODING_AGENT_DIR", previousConfigDir);
+        restoreEnvVar("PI_PACKAGE_DIR", previousPackageDir);
       }
+    });
+  });
+
+  it("does not fall back to a stale package beside Pi's own installation", () => {
+    withTempDir((dir) => {
+      const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+      const previousPackageDir = process.env.PI_PACKAGE_DIR;
+      const agentDir = join(dir, "agent");
+      const nodeModules = join(dir, "global", "node_modules");
+      const piPackageDir = join(nodeModules, "@earendil-works", "pi-coding-agent");
+      writePiSettings(agentDir);
+      writePiWebAccessPackage(join(nodeModules, "pi-web-access"));
+      mkdirSync(piPackageDir, { recursive: true });
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      process.env.PI_PACKAGE_DIR = piPackageDir;
+
+      try {
+        assert.throws(
+          () => testApi.resolvePiWebAccessExtension(),
+          /unavailable under Pi's effective npm root/i,
+        );
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousConfigDir);
+        restoreEnvVar("PI_PACKAGE_DIR", previousPackageDir);
+      }
+    });
+  });
+
+  it("fails closed with repair guidance for missing or invalid pi-web-access packages", () => {
+    withTempDir((dir) => {
+      const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+      const previousPackageDir = process.env.PI_PACKAGE_DIR;
+      const agentDir = join(dir, "agent");
+      const packageRoot = join(agentDir, "npm", "node_modules", "pi-web-access");
+      writePiSettings(agentDir);
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      process.env.PI_PACKAGE_DIR = join(dir, "isolated-pi-package");
+
+      try {
+        assert.throws(
+          () => testApi.getToolExtensionPath("web_search"),
+          /unavailable under Pi's effective npm root.*pi install npm:pi-web-access.*fresh subagent/i,
+        );
+
+        writePiWebAccessPackage(packageRoot, { name: "unrelated-package" });
+        assert.throws(
+          () => testApi.getToolExtensionPath("fetch_content"),
+          /invalid package identity.*expected name "pi-web-access".*repair/i,
+        );
+
+        writeFileSync(join(packageRoot, "package.json"), "{not-json");
+        assert.throws(
+          () => testApi.getToolExtensionPath("get_search_content"),
+          /invalid manifest.*package\.json.*repair/i,
+        );
+
+        writeFileSync(
+          join(packageRoot, "package.json"),
+          JSON.stringify({ name: "pi-web-access", version: "0.27.0", pi: { extensions: ["./one.ts", "./two.ts"] } }),
+        );
+        assert.throws(
+          () => testApi.getToolExtensionPath("web_search"),
+          /pi\.extensions must name exactly one concrete extension entrypoint/i,
+        );
+
+        writeFileSync(
+          join(packageRoot, "package.json"),
+          JSON.stringify({ name: "pi-web-access", version: "0.27.0", pi: { extensions: ["../outside.ts"] } }),
+        );
+        assert.throws(
+          () => testApi.getToolExtensionPath("source_check"),
+          /unsupported or escaping extension entrypoint/i,
+        );
+
+        writeFileSync(
+          join(packageRoot, "package.json"),
+          JSON.stringify({ name: "pi-web-access", version: "0.27.0", pi: { extensions: ["./missing.ts"] } }),
+        );
+        assert.throws(
+          () => testApi.getToolExtensionPath("source_check"),
+          /extension entrypoint is unavailable.*missing\.ts.*immutable/i,
+        );
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousConfigDir);
+        restoreEnvVar("PI_PACKAGE_DIR", previousPackageDir);
+      }
+    });
+  });
+
+  it("requires the exact unfiltered effective npm selector and rejects incompatible versions/config", () => {
+    withTempDir((dir) => {
+      const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+      const agentDir = join(dir, "agent");
+      const packageRoot = join(agentDir, "npm", "node_modules", "pi-web-access");
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        writePiSettings(agentDir, []);
+        writePiWebAccessPackage(packageRoot);
+        assert.throws(
+          () => testApi.resolvePiWebAccessExtension(),
+          /register exactly one unfiltered string.*npm:pi-web-access/i,
+        );
+
+        const localAlternative = join(dir, "local-web-package");
+        writePiWebAccessPackage(localAlternative);
+        for (const packages of [
+          ["npm:pi-web-access@0.27.0"],
+          [{ source: "npm:pi-web-access" }],
+          ["git:github.com/example/pi-web-access"],
+          ["../pi-web-access"],
+          ["npm:pi-web-access", "git:https://github.com/example/pi-web-access.git#main"],
+          ["npm:pi-web-access", "../local-web-package"],
+        ]) {
+          writePiSettings(agentDir, packages);
+          assert.throws(
+            () => testApi.resolvePiWebAccessExtension(),
+            /register exactly one unfiltered string.*npm:pi-web-access/i,
+          );
+        }
+
+        writePiSettings(agentDir);
+        writePiWebAccessPackage(packageRoot, { version: "0.10.7" });
+        assert.throws(
+          () => testApi.resolvePiWebAccessExtension(),
+          /unsupported pi-web-access version "0\.10\.7".*exactly 0\.27\.0/i,
+        );
+
+        writePiWebAccessPackage(packageRoot);
+        const configPath = join(agentDir, "web-search.json");
+        const incompatibleConfigs = [
+          { webSearch: { enabled: false } },
+          { tools: { sourceCheck: { enabled: false } } },
+          { tools: { fetchContent: { enabled: false } } },
+          { toolNames: { webSearch: "internet_search" } },
+          { toolNames: { getSearchContent: "read_search_result" } },
+        ];
+        for (const config of incompatibleConfigs) {
+          writeFileSync(configPath, JSON.stringify(config));
+          assert.throws(
+            () => testApi.resolvePiWebAccessExtension(),
+            /disables|must remain the canonical name/i,
+          );
+        }
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousConfigDir);
+      }
+    });
+  });
+
+  it("rejects package-root, manifest, entrypoint, and config path escapes", () => {
+    withTempDir((dir) => {
+      const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+      const agentDir = join(dir, "agent");
+      const nodeModules = join(agentDir, "npm", "node_modules");
+      const packageRoot = join(nodeModules, "pi-web-access");
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      writePiSettings(agentDir);
+      try {
+        const outsidePackage = join(dir, "outside-package");
+        writePiWebAccessPackage(outsidePackage);
+        mkdirSync(nodeModules, { recursive: true });
+        symlinkSync(outsidePackage, packageRoot, "dir");
+        assert.throws(
+          () => testApi.resolvePiWebAccessExtension(),
+          /package root is symlinked or resolves outside/i,
+        );
+
+        rmSync(packageRoot, { force: true });
+        const entrypoint = writePiWebAccessPackage(packageRoot);
+        const outsideEntrypoint = join(dir, "outside-entry.ts");
+        writeFileSync(outsideEntrypoint, "export default () => {};\n");
+        rmSync(entrypoint);
+        symlinkSync(outsideEntrypoint, entrypoint);
+        assert.throws(
+          () => testApi.resolvePiWebAccessExtension(),
+          /extension entrypoint resolves outside/i,
+        );
+
+        rmSync(packageRoot, { recursive: true, force: true });
+        const internalEntrypoint = writePiWebAccessPackage(packageRoot);
+        const internalEntrypointTarget = join(packageRoot, "internal-entry.ts");
+        writeFileSync(internalEntrypointTarget, "export default () => {};\n");
+        rmSync(internalEntrypoint);
+        symlinkSync(internalEntrypointTarget, internalEntrypoint);
+        assert.throws(
+          () => testApi.resolvePiWebAccessExtension(),
+          /extension entrypoint must not be a symlink/i,
+        );
+
+        rmSync(packageRoot, { recursive: true, force: true });
+        writePiWebAccessPackage(packageRoot);
+        for (const extensionSpec of [
+          "../escape.ts",
+          "/absolute/escape.ts",
+          "file:./index.ts",
+          "https://example.test/index.ts",
+          "./runtime/*.ts",
+          ".\\runtime\\index.ts",
+        ]) {
+          writeFileSync(
+            join(packageRoot, "package.json"),
+            JSON.stringify({
+              name: "pi-web-access",
+              version: "0.27.0",
+              pi: { extensions: [extensionSpec] },
+            }),
+          );
+          assert.throws(
+            () => testApi.resolvePiWebAccessExtension(),
+            /unsupported or escaping extension entrypoint/i,
+            extensionSpec,
+          );
+        }
+
+        writePiWebAccessPackage(packageRoot);
+        const outsideConfig = join(dir, "outside-web-search.json");
+        writeFileSync(outsideConfig, "{}");
+        symlinkSync(outsideConfig, join(agentDir, "web-search.json"));
+        assert.throws(
+          () => testApi.resolvePiWebAccessExtension(),
+          /config resolves outside its allowed root/i,
+        );
+
+        rmSync(join(agentDir, "web-search.json"));
+        const internalConfig = join(agentDir, "internal-web-search.json");
+        writeFileSync(internalConfig, "{}");
+        symlinkSync(internalConfig, join(agentDir, "web-search.json"));
+        assert.throws(
+          () => testApi.resolvePiWebAccessExtension(),
+          /config must not be a symlink/i,
+        );
+
+        rmSync(join(agentDir, "web-search.json"));
+        rmSync(internalConfig);
+        symlinkSync(join(agentDir, "missing-web-search.json"), join(agentDir, "web-search.json"));
+        assert.throws(
+          () => testApi.resolvePiWebAccessExtension(),
+          /config is unavailable/i,
+        );
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousConfigDir);
+      }
+    });
+  });
+
+  it("binds resume identity to canonical extension bytes and pi-web-access package/config state", () => {
+    withTempDir((dir) => {
+      const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+      const agentDir = join(dir, "agent");
+      const packageRoot = join(agentDir, "npm", "node_modules", "pi-web-access");
+      writePiSettings(agentDir);
+      const entrypoint = writePiWebAccessPackage(packageRoot);
+      const configPath = join(agentDir, "web-search.json");
+      writeFileSync(configPath, JSON.stringify({ provider: "one" }));
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        const allowlist = "web_search,fetch_content,get_search_content,source_check,ask_question";
+        const toolExtensions = testApi.resolveToolBackingExtensions(allowlist, agentDir);
+        const toolExtensionIdentities = testApi.createToolExtensionIdentities(
+          toolExtensions,
+          allowlist,
+          agentDir,
+        );
+        const loadout: SubagentLoadout = {
+          agent: "researcher",
+          toolAllowlist: allowlist,
+          toolExtensions,
+          toolExtensionIdentities,
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: dir,
+          agentDir,
+        };
+        assert.equal(testApi.verifySavedToolExtensions(loadout), null);
+
+        writeFileSync(join(agentDir, "web-search.json"), JSON.stringify({
+          toolNames: { webSearch: "internet_search" },
+        }));
+        assert.match(testApi.verifySavedToolExtensions(loadout), /canonical name/i);
+        writeFileSync(configPath, JSON.stringify({ provider: "two" }));
+        assert.match(testApi.verifySavedToolExtensions(loadout), /full config identity drifted/i);
+        writeFileSync(configPath, JSON.stringify({ provider: "one" }));
+
+        writeFileSync(entrypoint, "export default function changed() {}\n");
+        assert.match(testApi.verifySavedToolExtensions(loadout), /digest drifted/i);
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousConfigDir);
+      }
+    });
+  });
+
+  it("fails closed and cleans up bounded preflight errors, malformed state, extension errors, and timeouts", () => {
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent");
+      const extensionPath = join(dir, "web-extension.ts");
+      const inspectorPath = join(dir, "inspector.ts");
+      mkdirSync(agentDir);
+      writeFileSync(extensionPath, "export default () => {};\n");
+      writeFileSync(inspectorPath, "export default () => {};\n");
+      const temporaryPreflights = () => readdirSync(tmpdir())
+        .filter((name) => name.startsWith("pi-web-access-preflight-"))
+        .sort();
+      const beforeTemporary = temporaryPreflights();
+
+      const writeFakePi = (name: string, body: string): string => {
+        const path = join(dir, `${name}.mjs`);
+        writeFileSync(path, `#!/usr/bin/env node\n${body}\n`);
+        chmodSync(path, 0o755);
+        return path;
+      };
+      const run = (piCommand: string, timeoutMs = 2_000) =>
+        testApi.preflightPiWebAccessCapabilities({
+          cwd: realpathSync(dir),
+          agentDir: realpathSync(agentDir),
+          extensionPath: realpathSync(extensionPath),
+          inspectorPath: realpathSync(inspectorPath),
+          piCommand,
+          timeoutMs,
+        });
+      const validSnapshot = [
+        'import { writeFileSync } from "node:fs";',
+        "writeFileSync(process.env.PI_WEB_ACCESS_PREFLIGHT_OUTPUT, JSON.stringify({",
+        "  nonce: process.env.PI_WEB_ACCESS_PREFLIGHT_NONCE,",
+        "  activeTools: [\"fetch_content\",\"get_search_content\",\"source_check\",\"web_search\"],",
+        "}));",
+      ].join("\n");
+
+      const nonzero = writeFakePi("nonzero", "process.exit(7);");
+      assert.throws(() => run(nonzero), /exited unsuccessfully.*status 7/i);
+
+      const malformed = writeFakePi(
+        "malformed",
+        `${validSnapshot}\nprocess.stdout.write("not-json\\n");`,
+      );
+      assert.throws(() => run(malformed), /emitted malformed output/i);
+
+      const extensionError = writeFakePi(
+        "extension-error",
+        `${validSnapshot}\n` +
+          'console.log(JSON.stringify({type:"extension_error",extensionPath:"fixture",error:"boom"}));\n' +
+          'console.log(JSON.stringify({type:"response",id:"pi-web-access-preflight",command:"get_state",success:true}));',
+      );
+      assert.throws(() => run(extensionError), /reported an extension error/i);
+
+      const noSnapshot = writeFakePi(
+        "no-snapshot",
+        'console.log(JSON.stringify({type:"response",id:"pi-web-access-preflight",command:"get_state",success:true}));',
+      );
+      assert.throws(() => run(noSnapshot), /active-tool state could not be inspected/i);
+
+      const extraRecord = writeFakePi(
+        "extra-record",
+        `${validSnapshot}\n` +
+          'console.log(JSON.stringify({type:"response",id:"pi-web-access-preflight",command:"get_state",success:true}));\n' +
+          'console.log(JSON.stringify({type:"unexpected"}));',
+      );
+      assert.throws(() => run(extraRecord), /only successful response/i);
+
+      const stderr = writeFakePi(
+        "stderr",
+        `${validSnapshot}\n` +
+          'console.log(JSON.stringify({type:"response",id:"pi-web-access-preflight",command:"get_state",success:true}));\n' +
+          'console.error("unexpected warning");',
+      );
+      assert.throws(() => run(stderr), /unexpected stderr/i);
+
+      const pidPath = join(dir, "timeout.pid");
+      const childPidPath = join(dir, "timeout-child.pid");
+      const timeout = writeFakePi("timeout", [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+        'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+        `writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));`,
+        "setInterval(() => {}, 1000);",
+      ].join("\n"));
+      const started = Date.now();
+      assert.throws(() => run(timeout, 500), /timed out after 500ms/i);
+      assert.ok(Date.now() - started < 1_500, "timeout must stay tightly bounded");
+
+      const assertProcessGone = (path: string): void => {
+        const pid = Number(readFileSync(path, "utf8"));
+        const deadline = Date.now() + 500;
+        while (Date.now() < deadline) {
+          try {
+            process.kill(pid, 0);
+          } catch (error: any) {
+            if (error?.code === "ESRCH") return;
+            throw error;
+          }
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+        assert.fail(`preflight process ${pid} remained alive after timeout cleanup`);
+      };
+      assertProcessGone(pidPath);
+      assertProcessGone(childPidPath);
+      assert.deepEqual(temporaryPreflights(), beforeTemporary, "all temporary snapshots must be removed");
     });
   });
 
@@ -1803,6 +2342,7 @@ describe("subagent discovery", () => {
           agent: "worker",
           toolAllowlist: "subagent,subagent_message,subagent_resume,subagent_kill,subagents_list",
           toolExtensions: [],
+          toolExtensionIdentities: [],
           model: null,
           thinking: null,
           systemPromptMode: null,
@@ -1834,6 +2374,7 @@ describe("subagent discovery", () => {
           agent: "custom",
           toolAllowlist: testApi.buildSubagentToolAllowlist(undefined),
           toolExtensions: [],
+          toolExtensionIdentities: [],
           model: null,
           thinking: null,
           systemPromptMode: null,
@@ -1860,6 +2401,7 @@ describe("subagent discovery", () => {
           agent: "worker",
           toolAllowlist: "read,write,safe_bash",
           toolExtensions: [],
+          toolExtensionIdentities: [],
           model: "openrouter/z-ai/glm-5.2",
           thinking: "medium",
           systemPromptMode: "append",
@@ -1898,6 +2440,7 @@ describe("subagent discovery", () => {
           agent: null,
           toolAllowlist: null,
           toolExtensions: null,
+          toolExtensionIdentities: null,
           model: null,
           thinking: null,
           systemPromptMode: null,
@@ -2186,7 +2729,7 @@ describe("subagent-done.ts", () => {
       }
     });
 
-    it("writes a .ask signal with name/agent/question and does NOT shut the session down", async () => {
+    it("records a pending question without shutting down or creating sidecar IPC", async () => {
       const dir = createTestDir();
       const sessionFile = join(dir, "s.jsonl");
       const { mock, restore } = setupSubagentExtension(sessionFile);
@@ -2199,24 +2742,38 @@ describe("subagent-done.ts", () => {
         assert.equal(shutdownCalled, false, "ask_question must keep the session open");
         assert.match(out.content[0].text, /wait/i);
 
-        const askFile = `${sessionFile}.ask`;
-        assert.ok(existsSync(askFile), ".ask signal file should be written");
-        const payload = JSON.parse(readFileSync(askFile, "utf-8"));
-        assert.equal(payload.question, "Which API base URL?");
-        assert.equal(payload.name, "scout-2");
-        assert.equal(payload.agent, "scout");
-        // No .exit sidecar — the session is not exiting.
-        assert.ok(!existsSync(`${sessionFile}.exit`));
+        assert.ok(!existsSync(`${sessionFile}.ask`), "ask_question uses settled records, not sidecar IPC");
+        assert.ok(!existsSync(`${sessionFile}.exit`), "the session is not exiting");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
       }
     });
 
-    // Regression tests for the mid-run reply race: a reply steered in while the
-    // asking run is still open fires `input` but NOT `agent_start`, so the flag
-    // must be cleared on `input` or the session parks forever.
-    function setupCapturingExtension(sessionFile: string) {
+    it("rejects empty and whitespace-only questions before changing lifecycle state", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "empty-question.jsonl");
+      const { mock, restore } = setupSubagentExtension(sessionFile);
+      try {
+        const tool = mock.registeredTools.find((t) => t.name === "ask_question");
+        await assert.rejects(
+          tool.execute("call-empty", { question: "  \n\t " }, undefined, undefined, { shutdown() {} }),
+          /non-empty question/,
+        );
+        assert.equal(existsSync(`${sessionFile}.idle`), false);
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // A mid-run reply fires `input` but not necessarily `agent_start`, so input
+    // is the authoritative boundary that clears the pending question.
+    function setupCapturingExtension(
+      sessionFile: string,
+      autoExit = true,
+      extension = subagentDoneExtension,
+    ) {
       const handlers = new Map<string, Array<(...args: any[]) => void>>();
       const tools: any[] = [];
       const api = {
@@ -2237,8 +2794,9 @@ describe("subagent-done.ts", () => {
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       process.env.PI_SUBAGENT_NAME = "scout-2";
       process.env.PI_SUBAGENT_AGENT = "scout";
-      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-      subagentDoneExtension(api);
+      if (autoExit) process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      else delete process.env.PI_SUBAGENT_AUTO_EXIT;
+      extension(api);
       const emit = (event: string, ...args: any[]) =>
         (handlers.get(event) ?? []).forEach((h) => h(...args));
       const restore = () => {
@@ -2254,17 +2812,327 @@ describe("subagent-done.ts", () => {
       return { emit, ask, restore };
     }
 
+    it("publishes every interactive settled cycle and batches accumulated delivery", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "interactive.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile, false);
+      try {
+        emit("agent_start");
+        emit(
+          "agent_end",
+          {
+            messages: [{
+              role: "assistant",
+              stopReason: "stop",
+              content: [{ type: "text", text: "First checkpoint" }],
+            }],
+          },
+          { shutdown() { assert.fail("interactive child must remain alive"); } },
+        );
+        assert.equal(existsSync(`${sessionFile}.idle`), false, "agent_end is not settled");
+        emit("agent_settled", {}, { isIdle() { return true; } });
+
+        emit("input");
+        emit("agent_start");
+        emit(
+          "agent_end",
+          {
+            messages: [{
+              role: "assistant",
+              stopReason: "stop",
+              content: [{ type: "text", text: "Second checkpoint" }],
+            }],
+          },
+          { shutdown() { assert.fail("interactive child must remain alive"); } },
+        );
+        emit("agent_settled", {}, { isIdle() { return true; } });
+
+        const notifications = readSettledRecords(sessionFile);
+        assert.equal(notifications.length, 2);
+        assert.equal(notifications[0].state, "idle");
+        assert.equal(notifications[0].response, "First checkpoint");
+        assert.equal(notifications[1].state, "idle");
+        assert.equal(notifications[1].response, "Second checkpoint");
+
+        const parent = createMockExtensionApi();
+        (subagentsModule as any).default(parent.api);
+        const running = settledRunning(sessionFile, "interactive-child");
+        (subagentsModule as any).__test__.deliverPendingSettled(running);
+        assert.equal(parent.sentMessages.length, 1, "accumulated settlements are one parent turn");
+        assert.equal(parent.sentMessages[0].message.details.settledCount, 2);
+        assert.deepEqual(parent.sentMessages[0].message.details.states, ["idle", "idle"]);
+        assert.equal(parent.sentMessages[0].message.details.response, "Second checkpoint");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps publication order monotonic when Date.now moves backwards", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "clock-rollback.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile, false);
+      const realNow = Date.now;
+      let now = 2_000;
+      Date.now = () => now;
+      try {
+        emit("agent_start");
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "First" }] }],
+        }, { shutdown() {} });
+        emit("agent_settled", {}, { isIdle() { return true; } });
+
+        now = 1_000;
+        emit("input");
+        emit("agent_start");
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Second" }] }],
+        }, { shutdown() {} });
+        emit("agent_settled", {}, { isIdle() { return true; } });
+
+        const records = readSettledRecords(sessionFile);
+        assert.deepEqual(records.map((record) => record.response), ["First", "Second"]);
+        assert.deepEqual(records.map((record) => record.settledAt), [2_000, 1_000]);
+      } finally {
+        Date.now = realNow;
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps sequence order across extension module reload with retained records", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "extension-reload.jsonl");
+      const moduleUrl = new URL("../pi-extension/subagents/subagent-done.ts", import.meta.url).href;
+      let restoreFirst: (() => void) | undefined;
+      let restoreSecond: (() => void) | undefined;
+      try {
+        const beforeReload = await import(`${moduleUrl}?settled-sequence=before`);
+        const first = setupCapturingExtension(sessionFile, false, beforeReload.default);
+        restoreFirst = first.restore;
+        first.emit("agent_start");
+        first.emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Before reload" }] }],
+        }, { shutdown() {} });
+        first.emit("agent_settled", {}, { isIdle() { return true; } });
+        restoreFirst();
+        restoreFirst = undefined;
+
+        const afterReload = await import(`${moduleUrl}?settled-sequence=after`);
+        const second = setupCapturingExtension(sessionFile, false, afterReload.default);
+        restoreSecond = second.restore;
+        second.emit("agent_start");
+        await second.ask();
+        second.emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "After reload" }] }],
+        }, { shutdown() {} });
+        second.emit("agent_settled", {}, { isIdle() { return true; } });
+
+        const files = readdirSync(`${sessionFile}.idle`).filter((name) => name.endsWith(".json"));
+        assert.ok(files.every((name) => name.split("-", 1)[0].length === 20));
+        const byResponse = new Map(files.map((name) => {
+          const payload = JSON.parse(readFileSync(join(`${sessionFile}.idle`, name), "utf8"));
+          return [payload.response, BigInt(name.split("-", 1)[0])];
+        }));
+        assert.ok(byResponse.get("After reload")! > byResponse.get("Before reload")!);
+        assert.deepEqual(
+          readSettledRecords(sessionFile).map((record) => record.state),
+          ["idle", "awaiting_answer"],
+        );
+
+        const parent = createMockExtensionApi();
+        (subagentsModule as any).default(parent.api);
+        (subagentsModule as any).__test__.deliverPendingSettled(
+          settledRunning(sessionFile, "extension-reload"),
+        );
+        assert.equal(parent.sentMessages[0].message.customType, "subagent_question");
+        assert.equal(parent.sentMessages[0].message.details.response, "After reload");
+      } finally {
+        restoreSecond?.();
+        restoreFirst?.();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("waits for agent_settled across retries and queued continuations before publishing idle", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "retry.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile, false);
+      try {
+        emit("agent_start");
+        emit("agent_end", {
+          messages: [{
+            role: "assistant",
+            stopReason: "error",
+            content: [{ type: "text", text: "Retrying" }],
+          }],
+        }, { shutdown() {} });
+        emit("agent_start");
+        emit("agent_end", {
+          messages: [{
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: "Continuation complete" }],
+          }],
+        }, { shutdown() {} });
+        assert.equal(existsSync(`${sessionFile}.idle`), false);
+
+        emit("agent_settled", {}, { isIdle() { return true; } });
+        const [notification] = readSettledRecords(sessionFile);
+        assert.equal(notification.state, "idle");
+        assert.equal(notification.response, "Continuation complete");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("publishes waiting_on_children even when settled context is not idle", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "nested-wait.jsonl");
+      const symbol = Symbol.for("pi-subagents/running-children-count");
+      const previous = (globalThis as any)[symbol];
+      (globalThis as any)[symbol] = () => 1;
+      const { emit, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        let shutdown = false;
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, false, "a live nested child suppresses auto-exit");
+        emit("agent_settled", {}, { isIdle() { return false; } });
+        const records = readSettledRecords(sessionFile);
+        assert.equal(records.length, 1);
+        assert.equal(records[0].state, "waiting_on_children");
+      } finally {
+        if (previous === undefined) delete (globalThis as any)[symbol];
+        else (globalThis as any)[symbol] = previous;
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("exits (does not park) when the reply arrives mid-run via input", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
       try {
         emit("agent_start");
-        await ask(); // sets awaitingAnswer mid-run
+        await ask(); // sets the pending question mid-run
         // Reply arrives MID-RUN as a steer: input fires, no new agent_start.
         emit("input");
         let shutdown = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
         assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
+        emit("agent_settled", {}, { isIdle() { return true; } });
+        assert.equal(
+          existsSync(join(dir, "s.jsonl.idle")),
+          false,
+          "auto-exit completion must deliver only the terminal result path",
+        );
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("retains and later batches a settled question when delivery fails after input settles", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "late-rejection.jsonl");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile, false);
+      try {
+        emit("agent_start");
+        await ask();
+        emit("agent_end", { messages: [] }, { shutdown() {} });
+        emit("agent_settled", {}, { isIdle() { return true; } });
+
+        const parent = createMockExtensionApi();
+        const acceptedSend = parent.api.sendMessage;
+        let forcedInterleaving = false;
+        parent.api.sendMessage = () => {
+          forcedInterleaving = true;
+          emit("input");
+          emit("agent_start");
+          emit("agent_end", {
+            messages: [{
+              role: "assistant",
+              stopReason: "stop",
+              content: [{ type: "text", text: "Input handled while parent send failed" }],
+            }],
+          }, { shutdown() {} });
+          emit("agent_settled", {}, { isIdle() { return true; } });
+          throw new Error("parent busy");
+        };
+        (subagentsModule as any).default(parent.api);
+        const running = settledRunning(sessionFile, "late-rejection");
+        const deliver = (subagentsModule as any).__test__.deliverPendingSettled;
+        deliver(running);
+        assert.equal(forcedInterleaving, true);
+        assert.deepEqual(
+          readSettledRecords(sessionFile).map((record) => record.state),
+          ["awaiting_answer", "idle"],
+          "immutable records survive the late rejected send",
+        );
+
+        parent.api.sendMessage = acceptedSend;
+        deliver(running);
+        deliver(running);
+        assert.equal(parent.sentMessages.length, 1, "the retained batch wakes the parent once");
+        assert.equal(parent.sentMessages[0].message.customType, "subagent_idle");
+        assert.deepEqual(
+          parent.sentMessages[0].message.details.states,
+          ["awaiting_answer", "idle"],
+        );
+        assert.match(parent.sentMessages[0].message.content, /awaiting_answer \(v1 or v2\?\)/);
+        assert.equal(
+          parent.sentMessages[0].message.details.response,
+          "Input handled while parent send failed",
+        );
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps a question pending across automatic retries until actual input arrives", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "ask-retry.jsonl");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile, false);
+      try {
+        emit("agent_start");
+        await ask();
+
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "error", content: [] }],
+        }, { shutdown() {} });
+        // Pi may start another low-level run for retry, compaction recovery, or
+        // an automatic continuation. No external reply has arrived.
+        emit("agent_start");
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "stop", content: [] }],
+        }, { shutdown() {} });
+        emit("agent_settled", {}, { isIdle() { return true; } });
+        assert.deepEqual(readSettledRecords(sessionFile)[0], {
+          type: "settled",
+          state: "awaiting_answer",
+          name: "scout-2",
+          agent: "scout",
+          settledAt: readSettledRecords(sessionFile)[0].settledAt,
+          question: "v1 or v2?",
+        });
+
+        // Actual pane/user input is the authoritative answer/supersession edge.
+        emit("input");
+        emit("agent_start");
+        emit("agent_end", {
+          messages: [{
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: "Reply incorporated after retry" }],
+          }],
+        }, { shutdown() {} });
+        emit("agent_settled", {}, { isIdle() { return true; } });
+        const records = readSettledRecords(sessionFile);
+        assert.deepEqual(records.map((record) => record.state), ["awaiting_answer", "idle"]);
+        assert.equal(records[1].response, "Reply incorporated after retry");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -2281,13 +3149,17 @@ describe("subagent-done.ts", () => {
         let shutdown = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
         assert.equal(shutdown, false, "pending question with no reply must park, not exit");
+        emit("agent_settled", {}, { isIdle() { return true; } });
+        const [record] = readSettledRecords(join(dir, "s.jsonl"));
+        assert.equal(record.state, "awaiting_answer");
+        assert.equal(record.question, "v1 or v2?");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
       }
     });
 
-    it("exits when the reply arrives as a new turn (agent_start also clears the flag)", async () => {
+    it("exits when input supplies the reply before a new turn", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
       try {
@@ -2306,6 +3178,109 @@ describe("subagent-done.ts", () => {
         restore();
         rmSync(dir, { recursive: true, force: true });
       }
+    });
+  });
+
+  it("does not let partial or corrupt publication block a later settled record", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "partial-idle-child.jsonl");
+      writeSettledRecord(sessionFile, `{"type":"settled","state":"idle"`, ".partial.tmp");
+      writeSettledRecord(sessionFile, `{"type":"settled","state":"idle"`, "00000000.json");
+      writeSettledRecord(
+        sessionFile,
+        { type: "settled", state: "awaiting_answer", question: "   " },
+        "00000000-whitespace.json",
+      );
+      writeSettledRecord(
+        sessionFile,
+        { type: "settled", state: "idle", response: "Valid checkpoint" },
+        "00000001.json",
+      );
+      const { api, sentMessages } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const running = settledRunning(sessionFile, "partial-idle-child");
+
+      const deliver = (subagentsModule as any).__test__.deliverPendingSettled;
+      deliver(running);
+      deliver(running);
+      assert.deepEqual(
+        sentMessages.map(({ message }) => message.details.response),
+        ["Valid checkpoint"],
+      );
+      assert.equal(
+        existsSync(join(`${sessionFile}.idle`, "00000000.json")),
+        false,
+        "a malformed finalized record is retired rather than retried forever",
+      );
+      assert.equal(
+        existsSync(join(`${sessionFile}.idle`, "00000000-whitespace.json")),
+        false,
+        "an invalid awaiting state cannot diverge into an idle notification",
+      );
+    });
+  });
+
+  it("batches ordered settled records and retries the whole rejected batch once", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "idle-child.jsonl");
+      writeSettledRecord(
+        sessionFile,
+        { type: "settled", state: "idle", response: "First checkpoint" },
+        "00000001.json",
+      );
+      writeSettledRecord(
+        sessionFile,
+        { type: "settled", state: "waiting_on_children", response: "Second checkpoint" },
+        "00000002.json",
+      );
+      const { api, sentMessages } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const running = settledRunning(sessionFile, "idle-child");
+      const deliver = (subagentsModule as any).__test__.deliverPendingSettled;
+
+      deliver(running);
+      deliver(running);
+      assert.equal(sentMessages.length, 1, "accumulated records produce one parent wakeup");
+      assert.deepEqual(sentMessages[0].message.details.states, ["idle", "waiting_on_children"]);
+      assert.equal(sentMessages[0].message.details.status, "waiting_on_children");
+      assert.equal(sentMessages[0].message.details.response, "Second checkpoint");
+      assert.equal(sentMessages[0].message.details.running, true);
+      assert.match(sentMessages[0].message.content, /waiting on child sub-agents/);
+      assert.deepEqual(sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+
+      writeSettledRecord(
+        sessionFile,
+        { type: "settled", state: "idle", response: "Third checkpoint" },
+        "00000003.json",
+      );
+      deliver(running);
+      assert.equal(sentMessages.length, 2, "a later settled cycle wakes exactly once");
+      assert.equal(sentMessages[1].message.details.response, "Third checkpoint");
+
+      writeSettledRecord(
+        sessionFile,
+        { type: "settled", state: "idle", response: "Retryable checkpoint" },
+        "00000004.json",
+      );
+      const sendMessage = api.sendMessage;
+      api.sendMessage = () => { throw new Error("parent busy"); };
+      deliver(running);
+      assert.equal(sentMessages.length, 2, "a rejected send must not consume the record");
+      api.sendMessage = sendMessage;
+      deliver(running);
+      deliver(running);
+      assert.equal(sentMessages.length, 3, "the retried record is accepted exactly once");
+      assert.equal(sentMessages[2].message.details.response, "Retryable checkpoint");
+
+      writeSettledRecord(
+        sessionFile,
+        { type: "settled", state: "awaiting_answer", question: "Choose A or B?" },
+        "00000005.json",
+      );
+      deliver(running);
+      assert.equal(sentMessages[3].message.customType, "subagent_question");
+      assert.equal(sentMessages[3].message.details.status, "awaiting_answer");
+      assert.equal(sentMessages[3].message.details.question, "Choose A or B?");
     });
   });
 });
@@ -2498,6 +3473,8 @@ describe("integration harness owned child cleanup", () => {
       for (const path of [ownedChild, `${ownedChild}.loadout.json`, `${ownedChild}.ask`, `${ownedChild}.exit`]) {
         writeFileSync(path, "owned");
       }
+      mkdirSync(join(`${ownedChild}.idle`, "nested"), { recursive: true });
+      writeFileSync(join(`${ownedChild}.idle`, "nested", "record.json"), "owned");
       const unknownFile = join(ownedDir, "keep.me");
       writeFileSync(unknownFile, "unknown");
       writeFileSync(unownedChild, "unowned");
@@ -2522,6 +3499,7 @@ describe("integration harness owned child cleanup", () => {
       assert.equal(existsSync(`${ownedChild}.loadout.json`), false);
       assert.equal(existsSync(`${ownedChild}.ask`), false);
       assert.equal(existsSync(`${ownedChild}.exit`), false);
+      assert.equal(existsSync(`${ownedChild}.idle`), false, "owned settled queue is removed recursively");
       assert.equal(existsSync(unknownFile), true, "unknown files must prevent exact-dir removal");
       assert.equal(existsSync(ownedDir), true);
       assert.equal(existsSync(unownedChild), true, "unowned outer sessions must never be scanned");
@@ -2820,10 +3798,11 @@ describe("subagent activity snapshots", () => {
 
       recorder.sessionStart();
       currentNow = 3_000;
-      recorder.agentEndWaiting();
+      recorder.agentSettledWaiting();
       let read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "waiting");
+      assert.equal(read.activity.latestEvent, "agent_settled");
       assert.equal(read.activity.waitingSince, 3_000);
 
       currentNow = 4_000;
@@ -3265,7 +4244,7 @@ describe("subagent interruption", () => {
     });
   });
 
-  it("does not poll or deliver a pending question after kill aborts a pending screen read", async () => {
+  it("does not poll or deliver settled records after kill aborts a pending screen read", async () => {
     const controller = new AbortController();
     let releaseRead!: (screen: string) => void;
     let readStarted!: () => void;
@@ -3286,7 +4265,7 @@ describe("subagent interruption", () => {
     controller.abort();
     releaseRead("");
     await assert.rejects(polling, /Aborted/);
-    assert.equal(ticks, 0, "the watcher tick/question seam must not run after abort");
+    assert.equal(ticks, 0, "the watcher delivery seam must not run after abort");
   });
 
   it("steers a running subagent by typing into its pane (newlines flattened)", () => {
