@@ -1,0 +1,2811 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Decision presentation for a bounded Vercel Sandbox and Herdr subagent proof of concept.">
+  <title>Vercel Sandbox × Herdr — Conditional Go</title>
+  <script>
+    (function () {
+      document.documentElement.classList.add("js");
+      if ("scrollRestoration" in window.history) window.history.scrollRestoration = "manual";
+      try {
+        var savedTheme = window.localStorage.getItem("vercel-herdr-deck-theme");
+        if (savedTheme === "light" || savedTheme === "dark") {
+          document.documentElement.setAttribute("data-theme", savedTheme);
+        }
+      } catch (error) {
+        // File URLs or privacy settings may disable storage; OS preference remains authoritative.
+      }
+    }());
+  </script>
+  <style>
+    :root {
+      --ground: #edf2f1;
+      --surface: #fbfdfc;
+      --surface-strong: #ffffff;
+      --ink: #14211f;
+      --muted: #5d6e6a;
+      --line: #bdcbc7;
+      --line-strong: #788b86;
+      --grid: rgba(20, 33, 31, 0.045);
+      --terminal: #103a3a;
+      --terminal-ink: #dff8f2;
+      --signal: #087c75;
+      --transport: #2f608e;
+      --control: #a26013;
+      --danger: #a84235;
+      --shadow: rgba(16, 38, 34, 0.13);
+      --focus: #126eb2;
+      --display: "Avenir Next Condensed", "Arial Narrow", "Segoe UI", sans-serif;
+      --body: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      --mono: "SFMono-Regular", "Cascadia Code", "Roboto Mono", Consolas, monospace;
+      --radius: 3px;
+      --topbar-h: 52px;
+      --nav-h: 62px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ground: #091111;
+        --surface: #101a19;
+        --surface-strong: #152120;
+        --ink: #edf5f2;
+        --muted: #a8b9b5;
+        --line: #30413e;
+        --line-strong: #718781;
+        --grid: rgba(237, 245, 242, 0.045);
+        --terminal: #071f20;
+        --terminal-ink: #dff8f2;
+        --signal: #5ec8bd;
+        --transport: #7da9d4;
+        --control: #efb75c;
+        --danger: #ec8575;
+        --shadow: rgba(0, 0, 0, 0.34);
+        --focus: #8bc7f3;
+      }
+    }
+
+    :root[data-theme="dark"] {
+      --ground: #091111;
+      --surface: #101a19;
+      --surface-strong: #152120;
+      --ink: #edf5f2;
+      --muted: #a8b9b5;
+      --line: #30413e;
+      --line-strong: #718781;
+      --grid: rgba(237, 245, 242, 0.045);
+      --terminal: #071f20;
+      --terminal-ink: #dff8f2;
+      --signal: #5ec8bd;
+      --transport: #7da9d4;
+      --control: #efb75c;
+      --danger: #ec8575;
+      --shadow: rgba(0, 0, 0, 0.34);
+      --focus: #8bc7f3;
+    }
+
+    :root[data-theme="light"] {
+      --ground: #edf2f1;
+      --surface: #fbfdfc;
+      --surface-strong: #ffffff;
+      --ink: #14211f;
+      --muted: #5d6e6a;
+      --line: #bdcbc7;
+      --line-strong: #788b86;
+      --grid: rgba(20, 33, 31, 0.045);
+      --terminal: #103a3a;
+      --terminal-ink: #dff8f2;
+      --signal: #087c75;
+      --transport: #2f608e;
+      --control: #a26013;
+      --danger: #a84235;
+      --shadow: rgba(16, 38, 34, 0.13);
+      --focus: #126eb2;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      background: var(--ground);
+      scroll-behavior: smooth;
+    }
+
+    body {
+      min-height: 100vh;
+      min-height: 100svh;
+      margin: 0;
+      overflow-x: hidden;
+      background: var(--ground);
+      color: var(--ink);
+      font-family: var(--body);
+      line-height: 1.42;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button,
+    a {
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button {
+      color: inherit;
+      font: inherit;
+    }
+
+    a {
+      color: var(--transport);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 0.18em;
+    }
+
+    a:hover {
+      color: var(--signal);
+    }
+
+    :focus-visible {
+      outline: 3px solid var(--focus);
+      outline-offset: 3px;
+    }
+
+    .skip-link {
+      position: fixed;
+      z-index: 100;
+      top: 8px;
+      left: 8px;
+      padding: 8px 12px;
+      transform: translateY(-160%);
+      border: 1px solid var(--line-strong);
+      background: var(--surface-strong);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .skip-link:focus {
+      transform: translateY(0);
+    }
+
+    .app {
+      min-height: 100vh;
+      min-height: 100svh;
+    }
+
+    .deck-bar {
+      position: relative;
+      z-index: 20;
+      display: grid;
+      grid-template-columns: auto minmax(120px, 1fr) auto;
+      align-items: center;
+      min-height: var(--topbar-h);
+      gap: 20px;
+      padding: 0 22px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      white-space: nowrap;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .brand-mark {
+      display: inline-grid;
+      width: 22px;
+      height: 22px;
+      place-items: center;
+      border: 1px solid var(--signal);
+      color: var(--signal);
+      font-size: 12px;
+      line-height: 1;
+    }
+
+    .progress-wrap {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      gap: 12px;
+    }
+
+    .progress-wrap progress {
+      width: 100%;
+      height: 3px;
+      overflow: hidden;
+      border: 0;
+      border-radius: 0;
+      background: var(--line);
+      color: var(--signal);
+      appearance: none;
+    }
+
+    .progress-wrap progress::-webkit-progress-bar {
+      background: var(--line);
+    }
+
+    .progress-wrap progress::-webkit-progress-value {
+      background: var(--signal);
+    }
+
+    .progress-wrap progress::-moz-progress-bar {
+      background: var(--signal);
+    }
+
+    .count {
+      min-width: 58px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.08em;
+      white-space: nowrap;
+    }
+
+    .theme-toggle {
+      min-height: 32px;
+      padding: 5px 9px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: transparent;
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+    }
+
+    .theme-toggle:hover {
+      background: var(--surface-strong);
+    }
+
+    .deck {
+      position: relative;
+      width: 100%;
+      min-width: 0;
+    }
+
+    .slide {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      width: 100%;
+      min-width: 0;
+      gap: clamp(16px, 2.4vh, 26px);
+      padding: clamp(26px, 4vw, 64px) clamp(20px, 5vw, 76px) clamp(22px, 3.4vw, 48px);
+      border-bottom: 1px solid var(--line);
+      background-color: var(--surface);
+      background-image:
+        linear-gradient(var(--grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+      background-size: 32px 32px;
+      isolation: isolate;
+    }
+
+    .slide::before {
+      position: absolute;
+      z-index: -1;
+      inset: 14px;
+      border: 1px solid var(--line);
+      clip-path: polygon(0 0, calc(100% - 22px) 0, 100% 22px, 100% 100%, 0 100%);
+      content: "";
+      pointer-events: none;
+    }
+
+    .slide:target::before,
+    .slide.is-active::before {
+      border-color: var(--line-strong);
+    }
+
+    .slide-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: end;
+      gap: 24px;
+      min-width: 0;
+    }
+
+    .slide-head-copy {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .eyebrow {
+      margin: 0;
+      color: var(--signal);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3,
+    p,
+    ul,
+    ol,
+    figure,
+    table,
+    blockquote {
+      margin: 0;
+    }
+
+    h1,
+    h2,
+    h3 {
+      color: var(--ink);
+      font-family: var(--display);
+      font-weight: 700;
+      line-height: 0.98;
+      text-wrap: balance;
+    }
+
+    h1 {
+      max-width: 14ch;
+      font-size: clamp(48px, 7vw, 92px);
+      letter-spacing: -0.05em;
+    }
+
+    h2 {
+      max-width: 22ch;
+      font-size: clamp(30px, 4vw, 53px);
+      letter-spacing: -0.035em;
+    }
+
+    h3 {
+      font-size: clamp(18px, 2vw, 25px);
+      letter-spacing: -0.02em;
+      line-height: 1.06;
+    }
+
+    .slide-index {
+      align-self: start;
+      padding-top: 3px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .slide-content {
+      min-width: 0;
+      min-height: 0;
+    }
+
+    .lede {
+      max-width: 62ch;
+      color: var(--muted);
+      font-size: clamp(16px, 1.6vw, 21px);
+      line-height: 1.45;
+      text-wrap: pretty;
+    }
+
+    .source-line {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 4px 9px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 10.5px;
+      line-height: 1.35;
+    }
+
+    .source-line strong {
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 9.5px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .source-line a {
+      color: inherit;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 20px;
+      padding: 2px 7px;
+      border: 1px solid currentColor;
+      border-radius: 99px;
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.09em;
+      line-height: 1;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .badge--fact {
+      color: var(--transport);
+    }
+
+    .badge--proposal {
+      color: var(--signal);
+    }
+
+    .badge--gate {
+      color: var(--control);
+    }
+
+    .badge--stop {
+      color: var(--danger);
+    }
+
+    .mono {
+      font-family: var(--mono);
+    }
+
+    .decision-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(360px, 0.95fr);
+      align-items: stretch;
+      gap: clamp(28px, 6vw, 88px);
+      height: 100%;
+    }
+
+    .decision-argument {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 18px;
+    }
+
+    .verdict {
+      color: var(--control);
+    }
+
+    .terminal-line {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      max-width: 710px;
+      gap: 8px 14px;
+      padding: 11px 14px;
+      border-left: 3px solid var(--signal);
+      background: var(--terminal);
+      color: var(--terminal-ink);
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    .terminal-line .prompt {
+      color: #75dfcf;
+      font-weight: 800;
+    }
+
+    .decision-rail {
+      display: grid;
+      align-content: center;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .decision-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 18px;
+      min-height: 62px;
+      padding: 11px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .decision-row span:first-child {
+      max-width: 38ch;
+      font-size: 13px;
+      line-height: 1.32;
+    }
+
+    .decision-word {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .decision-word--go {
+      color: var(--signal);
+    }
+
+    .decision-word--conditional {
+      color: var(--control);
+    }
+
+    .decision-word--no {
+      color: var(--danger);
+    }
+
+    .evidence-key {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px 16px;
+      padding-top: 12px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .evidence-key span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .two-plane {
+      display: grid;
+      grid-template-columns: minmax(0, 1.08fr) minmax(280px, 0.92fr);
+      gap: clamp(28px, 5vw, 70px);
+      height: 100%;
+      min-height: 0;
+    }
+
+    .contract-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-content: center;
+      gap: 0;
+      counter-reset: contract;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .contract-item {
+      position: relative;
+      display: grid;
+      grid-template-columns: 30px minmax(0, 1fr);
+      align-items: start;
+      min-height: 76px;
+      gap: 8px;
+      padding: 13px 12px 13px 0;
+      border-bottom: 1px solid var(--line);
+      counter-increment: contract;
+    }
+
+    .contract-item:nth-child(odd) {
+      border-right: 1px solid var(--line);
+    }
+
+    .contract-item:nth-child(even) {
+      padding-left: 14px;
+    }
+
+    .contract-item::before {
+      color: var(--signal);
+      content: counter(contract, decimal-leading-zero);
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    .contract-item strong {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 13px;
+    }
+
+    .contract-item p {
+      color: var(--muted);
+      font-size: 11.5px;
+      line-height: 1.35;
+    }
+
+    .break-panel {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 18px;
+      padding: clamp(18px, 3vw, 34px);
+      border-left: 3px solid var(--danger);
+      background: color-mix(in srgb, var(--danger) 6%, var(--surface-strong));
+    }
+
+    .break-panel h3 {
+      color: var(--danger);
+    }
+
+    .break-chain {
+      display: grid;
+      gap: 0;
+      list-style: none;
+      padding: 0;
+    }
+
+    .break-chain li {
+      position: relative;
+      padding: 12px 10px 12px 31px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .break-chain li::before {
+      position: absolute;
+      left: 3px;
+      color: var(--danger);
+      content: "×";
+      font-family: var(--mono);
+      font-weight: 900;
+    }
+
+    .conclusion-strip {
+      padding: 12px 14px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
+    .ledger {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 42px minmax(0, 1fr);
+      align-items: stretch;
+      height: 100%;
+      min-height: 0;
+    }
+
+    .ledger-column {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 15px;
+      padding: 8px 0;
+    }
+
+    .ledger-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid var(--line-strong);
+    }
+
+    .ledger-head h3 {
+      max-width: 19ch;
+    }
+
+    .ledger-list {
+      display: grid;
+      align-content: center;
+      gap: 0;
+      list-style: none;
+      padding: 0;
+    }
+
+    .ledger-list li {
+      display: grid;
+      grid-template-columns: 20px minmax(0, 1fr);
+      gap: 9px;
+      padding: 9px 0;
+      border-bottom: 1px solid var(--line);
+      font-size: 12.5px;
+      line-height: 1.3;
+    }
+
+    .ledger-list li::before {
+      color: var(--signal);
+      content: "+";
+      font-family: var(--mono);
+      font-weight: 900;
+    }
+
+    .ledger-column--missing .ledger-list li::before {
+      color: var(--control);
+      content: "?";
+    }
+
+    .ledger-seam {
+      display: grid;
+      place-items: center;
+      color: var(--line-strong);
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      writing-mode: vertical-rl;
+    }
+
+    .protocol-warning {
+      grid-column: 1 / -1;
+      align-self: end;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+      padding: 11px 13px;
+      border: 1px solid var(--control);
+      background: color-mix(in srgb, var(--control) 5%, var(--surface));
+      font-size: 11.5px;
+    }
+
+    .architecture-wrap {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(300px, 1fr) auto;
+      gap: 11px;
+      height: 100%;
+      min-width: 0;
+      min-height: 0;
+    }
+
+    .architecture-wrap > * {
+      min-width: 0;
+    }
+
+    .path-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .path-controls .label {
+      margin-right: 5px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .path-button {
+      min-height: 29px;
+      padding: 4px 9px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: transparent;
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 10px;
+    }
+
+    .path-button[aria-pressed="true"] {
+      border-color: var(--ink);
+      background: var(--ink);
+      color: var(--surface);
+    }
+
+    .arch-stage {
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-strong);
+    }
+
+    .arch-stage svg {
+      display: block;
+      width: 100%;
+      min-width: 0;
+      height: 100%;
+      min-height: 0;
+    }
+
+    .arch-mobile {
+      display: none;
+      min-width: 0;
+      gap: 12px;
+    }
+
+    .mobile-channel {
+      min-width: 0;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-strong);
+    }
+
+    .mobile-channel--pty {
+      border-top: 3px solid var(--transport);
+    }
+
+    .mobile-channel--control {
+      border-top: 3px dashed var(--control);
+    }
+
+    .mobile-channel-head {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 4px 10px;
+      padding: 9px 11px;
+      border-bottom: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .mobile-channel-head span:last-child {
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .mobile-flow {
+      display: grid;
+      min-width: 0;
+      gap: 16px;
+      padding: 12px;
+      list-style: none;
+    }
+
+    .mobile-flow li {
+      position: relative;
+      display: grid;
+      min-width: 0;
+      gap: 2px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      font-size: 11px;
+      line-height: 1.3;
+    }
+
+    .mobile-flow li + li::before {
+      position: absolute;
+      top: -17px;
+      left: 50%;
+      color: var(--line-strong);
+      content: "↓";
+      font-family: var(--mono);
+      transform: translateX(-50%);
+    }
+
+    .mobile-flow strong {
+      font-size: 11.5px;
+    }
+
+    .mobile-boundary {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 8px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .mobile-channel--pty .mobile-flow li:nth-child(2) {
+      border-color: var(--transport);
+    }
+
+    .mobile-channel--control .mobile-flow li:nth-child(2),
+    .mobile-channel--control .mobile-flow li:nth-child(3) {
+      border-color: var(--control);
+    }
+
+    .architecture .boundary {
+      fill: color-mix(in srgb, var(--surface) 80%, transparent);
+      stroke: var(--line-strong);
+      stroke-dasharray: 5 5;
+      stroke-width: 1.2;
+    }
+
+    .architecture .boundary-seam {
+      fill: color-mix(in srgb, var(--control) 6%, var(--surface));
+      stroke: var(--control);
+      stroke-width: 1;
+    }
+
+    .architecture .node {
+      fill: var(--surface);
+      stroke: var(--line-strong);
+      stroke-width: 1.25;
+    }
+
+    .architecture .node-terminal {
+      fill: var(--terminal);
+      stroke: var(--signal);
+      stroke-width: 1.4;
+    }
+
+    .architecture .node-runner {
+      fill: color-mix(in srgb, var(--control) 8%, var(--surface));
+      stroke: var(--control);
+      stroke-width: 1.5;
+    }
+
+    .architecture .node-journal {
+      fill: color-mix(in srgb, var(--signal) 7%, var(--surface));
+      stroke: var(--signal);
+      stroke-width: 1.3;
+    }
+
+    .architecture .svg-label {
+      fill: var(--ink);
+      font-family: var(--body);
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .architecture .svg-small {
+      fill: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.025em;
+    }
+
+    .architecture .svg-terminal {
+      fill: var(--terminal-ink);
+    }
+
+    .architecture .svg-boundary {
+      fill: var(--muted);
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+    }
+
+    .architecture .pty-path,
+    .architecture .control-path {
+      transition: opacity 160ms ease;
+    }
+
+    .architecture .pty-line {
+      fill: none;
+      stroke: var(--transport);
+      stroke-linecap: square;
+      stroke-width: 3;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .architecture .control-line {
+      fill: none;
+      stroke: var(--control);
+      stroke-dasharray: 7 5;
+      stroke-linecap: square;
+      stroke-width: 2.4;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .architecture[data-mode="pty"] .control-path,
+    .architecture[data-mode="control"] .pty-path {
+      opacity: 0.42;
+    }
+
+    .path-notes {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .path-note {
+      display: grid;
+      grid-template-columns: 14px minmax(0, 1fr);
+      gap: 8px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 11.5px;
+      line-height: 1.35;
+      transition: opacity 160ms ease;
+    }
+
+    .path-note > span {
+      min-width: 0;
+    }
+
+    .path-note::before {
+      width: 12px;
+      height: 3px;
+      margin-top: 6px;
+      background: var(--transport);
+      content: "";
+    }
+
+    .path-note--control::before {
+      height: 2px;
+      background: repeating-linear-gradient(90deg, var(--control) 0 5px, transparent 5px 8px);
+    }
+
+    .architecture[data-mode="pty"] .path-note--control,
+    .architecture[data-mode="control"] .path-note--pty {
+      opacity: 0.58;
+    }
+
+    .lifecycle-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 22px;
+      height: 100%;
+      min-width: 0;
+    }
+
+    .lifecycle-layout > * {
+      min-width: 0;
+    }
+
+    .scroll-hint {
+      display: none;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 8.5px;
+      letter-spacing: 0.04em;
+    }
+
+    .state-scroll {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      overflow-x: auto;
+      overscroll-behavior-inline: contain;
+      padding-bottom: 5px;
+      scrollbar-color: var(--line-strong) transparent;
+    }
+
+    .state-track {
+      display: grid;
+      grid-template-columns: repeat(9, minmax(92px, 1fr));
+      align-items: center;
+      min-width: 910px;
+    }
+
+    .state {
+      position: relative;
+      display: grid;
+      min-height: 51px;
+      place-items: center;
+      padding: 7px 9px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-strong);
+      font-family: var(--mono);
+      font-size: 9.5px;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    .state:not(:last-child)::after {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -11px;
+      width: 20px;
+      height: 1px;
+      background: var(--signal);
+      content: "";
+    }
+
+    .state--active {
+      border-color: var(--signal);
+      color: var(--signal);
+    }
+
+    .state--terminal {
+      border-color: var(--control);
+      color: var(--control);
+    }
+
+    .exception-track {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 9px;
+    }
+
+    .exception-track strong {
+      color: var(--danger);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .operation-separation {
+      margin-left: auto;
+      color: var(--ink);
+    }
+
+    .recovery-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      align-items: stretch;
+      gap: 0;
+      border-top: 1px solid var(--line-strong);
+      border-bottom: 1px solid var(--line-strong);
+    }
+
+    .recovery-case {
+      display: grid;
+      align-content: start;
+      gap: 9px;
+      padding: 18px clamp(14px, 2.4vw, 28px);
+    }
+
+    .recovery-case + .recovery-case {
+      border-left: 1px solid var(--line);
+    }
+
+    .recovery-label {
+      color: var(--signal);
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .recovery-case p {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.38;
+    }
+
+    .authority-rule {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
+      align-items: center;
+      gap: 11px;
+      margin-top: 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--control);
+      background: color-mix(in srgb, var(--control) 5%, var(--surface));
+      font-size: 11.5px;
+    }
+
+    .security-layout {
+      display: grid;
+      grid-template-columns: minmax(300px, 0.88fr) minmax(0, 1.12fr);
+      gap: clamp(28px, 5vw, 70px);
+      height: 100%;
+    }
+
+    .identity-stack {
+      display: grid;
+      align-content: center;
+      gap: 0;
+    }
+
+    .identity-layer {
+      position: relative;
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr);
+      gap: 16px;
+      padding: 15px 16px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-strong);
+    }
+
+    .identity-layer + .identity-layer {
+      margin-top: -1px;
+    }
+
+    .identity-layer:nth-child(2) {
+      margin-right: 22px;
+      margin-left: 22px;
+      border-color: var(--control);
+    }
+
+    .identity-layer:nth-child(3) {
+      margin-right: 44px;
+      margin-left: 44px;
+      border: 2px solid var(--danger);
+    }
+
+    .identity-name {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .identity-layer strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 13px;
+    }
+
+    .identity-layer p {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
+    .security-checks {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      align-content: center;
+      gap: 16px;
+    }
+
+    .fail-closed {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 14px;
+      padding: 16px;
+      border-left: 4px solid var(--danger);
+      background: color-mix(in srgb, var(--danger) 6%, var(--surface-strong));
+    }
+
+    .fail-closed strong {
+      color: var(--danger);
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .fail-closed p {
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .check-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-content: start;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .check-item {
+      display: grid;
+      grid-template-columns: 17px minmax(0, 1fr);
+      gap: 8px;
+      padding: 10px 9px 10px 0;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11.5px;
+      line-height: 1.32;
+    }
+
+    .check-item:nth-child(odd) {
+      border-right: 1px solid var(--line);
+    }
+
+    .check-item:nth-child(even) {
+      padding-left: 11px;
+    }
+
+    .check-item::before {
+      color: var(--signal);
+      content: "□";
+      font-family: var(--mono);
+      font-weight: 900;
+    }
+
+    .table-wrap {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      overflow-x: auto;
+      overscroll-behavior-inline: contain;
+      border-top: 2px solid var(--line-strong);
+      border-bottom: 1px solid var(--line-strong);
+      scrollbar-color: var(--line-strong) transparent;
+    }
+
+    .compatibility-table {
+      width: 100%;
+      min-width: 790px;
+      border-collapse: collapse;
+      font-size: 11px;
+      line-height: 1.25;
+    }
+
+    .compatibility-table th,
+    .compatibility-table td {
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .compatibility-table th {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .compatibility-table th:first-child,
+    .compatibility-table td:first-child {
+      width: 25%;
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    .compatibility-table td:nth-child(2) {
+      color: var(--danger);
+    }
+
+    .compatibility-table td:nth-child(3) {
+      color: var(--signal);
+    }
+
+    .compatibility-table td:last-child {
+      font-family: var(--mono);
+      font-size: 9.5px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .scope-band {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr);
+      align-items: center;
+      gap: 14px 24px;
+      margin-top: 14px;
+      padding: 12px 14px;
+      border: 1px solid var(--signal);
+      background: color-mix(in srgb, var(--signal) 5%, var(--surface));
+      font-size: 11.5px;
+    }
+
+    .scope-band strong {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .poc-layout {
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+      gap: 14px;
+      height: 100%;
+    }
+
+    .stage-list {
+      display: grid;
+      align-content: center;
+      gap: 0;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .stage-row {
+      display: grid;
+      grid-template-columns: 84px minmax(170px, 0.8fr) minmax(0, 1.7fr);
+      align-items: center;
+      gap: 18px;
+      min-height: 60px;
+      padding: 9px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .stage-id {
+      display: grid;
+      gap: 3px;
+      font-family: var(--mono);
+    }
+
+    .stage-id strong {
+      color: var(--signal);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .stage-id span {
+      color: var(--muted);
+      font-size: 9px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stage-build strong,
+    .stage-gate strong {
+      display: block;
+      margin-bottom: 2px;
+      font-size: 11.5px;
+    }
+
+    .stage-build p,
+    .stage-gate p {
+      color: var(--muted);
+      font-size: 10.5px;
+      line-height: 1.3;
+    }
+
+    .stage-gate {
+      padding-left: 16px;
+      border-left: 2px solid var(--control);
+    }
+
+    .effort-strip {
+      display: grid;
+      grid-template-columns: auto repeat(3, minmax(0, 1fr));
+      align-items: center;
+      gap: 14px;
+      padding: 10px 13px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-strong);
+    }
+
+    .effort-strip > strong {
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .effort-item {
+      display: grid;
+      gap: 1px;
+      font-size: 10px;
+    }
+
+    .effort-item strong {
+      color: var(--control);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stop-layout {
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+      gap: 18px;
+      height: 100%;
+    }
+
+    .stop-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-content: center;
+      gap: 0 28px;
+      counter-reset: stop;
+    }
+
+    .stop-item {
+      position: relative;
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr);
+      align-items: start;
+      min-height: 76px;
+      gap: 9px;
+      padding: 13px 0;
+      border-top: 1px solid var(--line);
+      counter-increment: stop;
+      font-size: 12px;
+      line-height: 1.36;
+    }
+
+    .stop-item::before {
+      color: var(--danger);
+      content: "×" counter(stop);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 900;
+    }
+
+    .alternative-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      border: 1px solid var(--line-strong);
+      background: var(--surface-strong);
+    }
+
+    .alternative {
+      display: grid;
+      gap: 5px;
+      padding: 12px 14px;
+    }
+
+    .alternative + .alternative {
+      border-left: 1px solid var(--line);
+    }
+
+    .alternative strong {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .alternative p {
+      color: var(--muted);
+      font-size: 10.5px;
+      line-height: 1.3;
+    }
+
+    .decision-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-content: center;
+      gap: 0 34px;
+      height: 100%;
+      counter-reset: product-decision;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .decision-question {
+      display: grid;
+      grid-template-columns: 26px minmax(0, 1fr);
+      gap: 8px;
+      min-height: 65px;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--line);
+      counter-increment: product-decision;
+    }
+
+    .decision-question::before {
+      color: var(--control);
+      content: counter(product-decision, decimal-leading-zero);
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 800;
+    }
+
+    .decision-question strong {
+      display: block;
+      margin-bottom: 2px;
+      font-size: 11.5px;
+    }
+
+    .decision-question p {
+      color: var(--muted);
+      font-size: 10.5px;
+      line-height: 1.3;
+    }
+
+    .recommended {
+      color: var(--signal);
+      font-weight: 700;
+    }
+
+    .final-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.06fr) minmax(310px, 0.94fr);
+      align-items: stretch;
+      gap: clamp(28px, 5vw, 68px);
+      height: 100%;
+    }
+
+    .final-argument {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 18px;
+    }
+
+    .final-argument h2 {
+      max-width: 15ch;
+      color: var(--control);
+      font-size: clamp(42px, 6vw, 76px);
+    }
+
+    .promotion-line {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 12px;
+      max-width: 700px;
+      padding: 12px 14px;
+      border-left: 3px solid var(--signal);
+      background: color-mix(in srgb, var(--signal) 5%, var(--surface-strong));
+      font-size: 11.5px;
+      line-height: 1.42;
+    }
+
+    .final-side {
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr);
+      align-content: center;
+      gap: 16px;
+    }
+
+    .envelope {
+      border-top: 2px solid var(--line-strong);
+    }
+
+    .envelope-row {
+      display: grid;
+      grid-template-columns: 90px minmax(0, 1fr);
+      gap: 13px;
+      padding: 9px 0;
+      border-bottom: 1px solid var(--line);
+      font-size: 11px;
+    }
+
+    .envelope-row strong {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .fork-outcome {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      border: 1px solid var(--line-strong);
+    }
+
+    .fork-outcome div {
+      display: grid;
+      gap: 3px;
+      padding: 10px 12px;
+    }
+
+    .fork-outcome div + div {
+      border-left: 1px solid var(--line);
+    }
+
+    .fork-outcome strong {
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .fork-outcome span {
+      color: var(--muted);
+      font-size: 10.5px;
+    }
+
+    .key-sources {
+      display: grid;
+      align-content: start;
+      gap: 6px;
+      padding-top: 3px;
+      font-size: 10.5px;
+    }
+
+    .key-sources strong {
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .key-sources nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px 12px;
+    }
+
+    .deck-nav {
+      position: relative;
+      z-index: 20;
+      display: grid;
+      grid-template-columns: 120px minmax(0, 1fr) 120px;
+      align-items: center;
+      min-height: var(--nav-h);
+      gap: 16px;
+      padding: 8px 22px;
+      border-top: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    .nav-button {
+      min-height: 38px;
+      padding: 7px 11px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: transparent;
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .nav-button:hover:not(:disabled) {
+      border-color: var(--signal);
+      color: var(--signal);
+    }
+
+    .nav-button:disabled {
+      cursor: not-allowed;
+      opacity: 0.34;
+    }
+
+    .nav-status {
+      min-width: 0;
+      overflow: hidden;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.05em;
+      text-align: center;
+      text-overflow: ellipsis;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .nav-status strong {
+      color: var(--ink);
+    }
+
+    @media (min-width: 980px) and (min-height: 720px) {
+      body {
+        overflow: hidden;
+      }
+
+      .app {
+        display: grid;
+        grid-template-rows: var(--topbar-h) minmax(0, 1fr) var(--nav-h);
+        height: 100vh;
+        height: 100svh;
+      }
+
+      .deck {
+        display: grid;
+        min-height: 0;
+        place-items: stretch center;
+        padding: 12px clamp(12px, 2vw, 30px);
+      }
+
+      .slide {
+        width: min(100%, 1460px);
+        height: 100%;
+        min-height: 0;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        box-shadow: 0 12px 34px var(--shadow);
+      }
+
+      .js .deck:not(.reading-mode) .slide {
+        display: none;
+      }
+
+      .js .deck:not(.reading-mode) .slide.is-active {
+        display: grid;
+        animation: slide-in 180ms ease-out both;
+      }
+    }
+
+    @keyframes slide-in {
+      from {
+        opacity: 0;
+        transform: translateY(4px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 979px), (max-height: 719px) {
+      .deck-bar {
+        position: sticky;
+        top: 0;
+        grid-template-columns: auto 1fr auto;
+        gap: 10px;
+        padding: 0 12px;
+      }
+
+      .brand span:last-child {
+        display: none;
+      }
+
+      .slide {
+        min-height: 74svh;
+      }
+
+      .deck-nav {
+        position: sticky;
+        bottom: 0;
+        grid-template-columns: 88px minmax(0, 1fr) 88px;
+        padding: 7px 12px;
+        box-shadow: 0 -8px 24px var(--shadow);
+      }
+
+      .decision-layout,
+      .two-plane,
+      .security-layout,
+      .final-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .decision-rail {
+        align-content: start;
+      }
+
+      .ledger {
+        grid-template-columns: 1fr;
+        gap: 18px;
+      }
+
+      .ledger-seam {
+        display: none;
+      }
+
+      .protocol-warning {
+        grid-column: 1;
+      }
+
+      .slide-content,
+      .poc-layout,
+      .stop-layout,
+      .lifecycle-layout,
+      .architecture-wrap {
+        height: auto;
+      }
+
+      .scroll-hint {
+        display: block;
+      }
+    }
+
+    @media (max-width: 680px) {
+      .progress-wrap {
+        gap: 7px;
+      }
+
+      .count {
+        min-width: 45px;
+        font-size: 9px;
+      }
+
+      .theme-toggle {
+        width: 50px;
+        overflow: hidden;
+        padding: 5px;
+        font-size: 0;
+        white-space: nowrap;
+      }
+
+      .theme-toggle::after {
+        content: attr(data-short-label);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.02em;
+      }
+
+      .slide {
+        gap: 18px;
+        padding: 34px 24px 30px;
+      }
+
+      .slide::before {
+        inset: 8px;
+      }
+
+      .slide-head {
+        grid-template-columns: 1fr;
+        gap: 7px;
+      }
+
+      .slide-index {
+        order: -1;
+      }
+
+      h1 {
+        font-size: clamp(44px, 15vw, 66px);
+      }
+
+      h2 {
+        font-size: clamp(31px, 10vw, 46px);
+      }
+
+      .contract-list,
+      .check-grid,
+      .stop-grid,
+      .decision-grid,
+      .path-notes,
+      .fork-outcome {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .architecture-wrap {
+        grid-template-rows: auto auto auto;
+      }
+
+      .arch-stage {
+        display: none;
+      }
+
+      .arch-mobile {
+        display: grid;
+      }
+
+      .contract-item:nth-child(odd),
+      .check-item:nth-child(odd) {
+        border-right: 0;
+      }
+
+      .contract-item:nth-child(even),
+      .check-item:nth-child(even) {
+        padding-left: 0;
+      }
+
+      .recovery-grid,
+      .alternative-strip {
+        grid-template-columns: 1fr;
+      }
+
+      .recovery-case + .recovery-case,
+      .alternative + .alternative,
+      .fork-outcome div + div {
+        border-top: 1px solid var(--line);
+        border-left: 0;
+      }
+
+      .authority-rule {
+        grid-template-columns: auto minmax(0, 1fr);
+      }
+
+      .operation-separation {
+        flex-basis: 100%;
+        margin-left: 0;
+      }
+
+      .identity-layer,
+      .identity-layer:nth-child(2),
+      .identity-layer:nth-child(3) {
+        grid-template-columns: 1fr;
+        margin-right: 0;
+        margin-left: 0;
+      }
+
+      .scope-band {
+        grid-template-columns: 1fr;
+      }
+
+      .stage-row {
+        grid-template-columns: 72px minmax(0, 1fr);
+        gap: 10px;
+      }
+
+      .stage-gate {
+        grid-column: 1 / -1;
+      }
+
+      .effort-strip {
+        grid-template-columns: 1fr;
+      }
+
+      .nav-status span {
+        display: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+
+    @media print {
+      :root,
+      :root[data-theme="dark"],
+      :root[data-theme="light"] {
+        --ground: #ffffff;
+        --surface: #ffffff;
+        --surface-strong: #ffffff;
+        --ink: #101918;
+        --muted: #43524f;
+        --line: #aab6b3;
+        --line-strong: #53645f;
+        --grid: rgba(16, 25, 24, 0.035);
+        --terminal: #103a3a;
+        --terminal-ink: #ffffff;
+        --signal: #006e68;
+        --transport: #27557d;
+        --control: #915510;
+        --danger: #8f3429;
+      }
+
+      @page {
+        size: landscape;
+        margin: 0;
+      }
+
+      body {
+        overflow: visible !important;
+        background: #ffffff;
+        print-color-adjust: exact;
+        -webkit-print-color-adjust: exact;
+      }
+
+      .app {
+        display: block !important;
+        height: auto !important;
+      }
+
+      .deck-bar,
+      .deck-nav,
+      .path-controls,
+      .scroll-hint,
+      .skip-link {
+        display: none !important;
+      }
+
+      .deck {
+        display: block !important;
+        padding: 0 !important;
+      }
+
+      .slide,
+      .js .deck .slide,
+      .js .deck .slide.is-active {
+        display: grid !important;
+        width: 100% !important;
+        height: 100vh !important;
+        min-height: 7.4in !important;
+        overflow: hidden !important;
+        break-after: page;
+        page-break-after: always;
+        border: 0 !important;
+        box-shadow: none !important;
+      }
+
+      .slide:last-child {
+        break-after: auto;
+        page-break-after: auto;
+      }
+
+      .arch-stage {
+        display: block !important;
+        min-height: 300px;
+        overflow: hidden;
+      }
+
+      .arch-mobile {
+        display: none !important;
+      }
+
+      .arch-stage svg {
+        min-width: 0;
+      }
+
+      .architecture .pty-path,
+      .architecture .control-path,
+      .architecture .path-note {
+        opacity: 1 !important;
+      }
+
+      a {
+        color: inherit;
+      }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#deck">Skip to presentation</a>
+  <div class="app">
+    <header class="deck-bar" aria-label="Presentation controls">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">&gt;_</span><span>Herdr / Vercel viability</span></div>
+      <div class="progress-wrap">
+        <progress id="deck-progress" max="11" value="1">Slide 1 of 11</progress>
+        <span class="count" id="slide-count" aria-live="polite">01 / 11</span>
+      </div>
+      <button class="theme-toggle" id="theme-toggle" type="button" title="Cycle theme: Auto, Light, Dark" aria-label="Theme: automatic" data-short-label="Auto">Theme · Auto</button>
+    </header>
+
+    <main class="deck" id="deck" aria-label="Vercel Sandbox and Herdr viability presentation">
+      <section class="slide slide--decision is-active" id="decision" data-title="Decision" tabindex="-1" aria-labelledby="decision-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Funding decision · Vercel Sandbox × Herdr</p>
+            <h1 id="decision-title" class="verdict">Conditional go.</h1>
+          </div>
+          <span class="slide-index">Decision / 01</span>
+        </header>
+        <div class="slide-content decision-layout">
+          <div class="decision-argument">
+            <p class="lede">Authorize a bounded proof of concept—and only then an opt-in execution target for selected Pi-backed children. The terminal path exists. The lifecycle protocol does not.</p>
+            <div class="terminal-line" aria-label="Target configuration summary">
+              <span class="prompt">$</span>
+              <span>surface=herdr</span>
+              <span>execution-target=vercel</span>
+              <span>mode=experimental</span>
+            </div>
+            <div class="evidence-key" aria-label="Evidence labels used in this presentation">
+              <span><span class="badge badge--fact">Verified</span> repository or upstream fact</span>
+              <span><span class="badge badge--proposal">Proposal</span> recommended design</span>
+              <span><span class="badge badge--gate">Gate</span> unknown to prove</span>
+            </div>
+          </div>
+          <div class="decision-rail" aria-label="Scope decisions">
+            <div class="decision-row"><span>Native Pi TUI in a Herdr pane backed by Vercel</span><span class="decision-word decision-word--go">Go for PoC</span></div>
+            <div class="decision-row"><span>Selected non-nesting children with result, question and resume</span><span class="decision-word decision-word--conditional">Conditional</span></div>
+            <div class="decision-row"><span>Every current profile and feature without semantic changes</span><span class="decision-word decision-word--no">No-go</span></div>
+            <div class="decision-row"><span>Production before protocol, recovery and security gates pass</span><span class="decision-word decision-word--no">No-go</span></div>
+          </div>
+        </div>
+        <footer class="source-line">
+          <strong>Primary evidence</strong>
+          <a href="https://vercel.com/docs/sandbox">Vercel Sandbox</a>
+          <a href="https://vercel.com/docs/sandbox/ecosystem/herdr">Official Herdr integration</a>
+          <a href="https://github.com/vercel/sandbox/blob/be86cc619390868ae08435fde227c6896b8acad9/packages/sandbox/src/interactive-shell/interactive-shell.ts#L40-L217">Pinned interactive CLI source</a>
+        </footer>
+      </section>
+
+      <section class="slide" id="not-drop-in" data-title="Why not drop-in" tabindex="-1" aria-labelledby="drop-in-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Current contract</p>
+            <h2 id="drop-in-title">The terminal is the easy part.</h2>
+          </div>
+          <span class="slide-index">Compatibility / 02</span>
+        </header>
+        <div class="slide-content two-plane">
+          <div class="contract-list" aria-label="Responsibilities in the current extension">
+            <div class="contract-item"><div><strong>Surface ownership</strong><p>Exactly <span class="mono">tmux</span> or <span class="mono">herdr</span>; a surface stays pinned to its creating adapter.</p></div></div>
+            <div class="contract-item"><div><strong>Local launch material</strong><p>Extension preflight, deterministic JSONL, loadout and task artifacts, then local <span class="mono">pi</span>.</p></div></div>
+            <div class="contract-item"><div><strong>Semantic observation</strong><p>Sentinels, activity and settled records—not pane appearance alone—establish state.</p></div></div>
+            <div class="contract-item"><div><strong>Question and result</strong><p><span class="mono">ask_question</span>, child waiting, result and stats come from structured session state.</p></div></div>
+            <div class="contract-item"><div><strong>Identity and resume</strong><p>Parent-scoped registry binds model, tools, digests, cwd, session and nesting boundary.</p></div></div>
+            <div class="contract-item"><div><strong>Fail-closed kill</strong><p>Terminate the owning surface first; uncertain death remains tracked.</p></div></div>
+          </div>
+          <aside class="break-panel" aria-label="Why a generic remote terminal breaks the contract">
+            <span class="badge badge--fact">Verified repository</span>
+            <h3>A generic remote Pi terminal breaks the chain.</h3>
+            <ul class="break-chain">
+              <li>No shared filesystem: local paths and sentinels are not remote facts.</li>
+              <li>Host absolute paths and extension digests cannot identify remote executables.</li>
+              <li>A process in Vercel cannot call the host’s local Herdr socket.</li>
+            </ul>
+            <p class="conclusion-strip"><strong>Conclusion:</strong> official plugin + custom Pi command is a terminal demo, not result/question/resume/nesting/ownership parity.</p>
+          </aside>
+        </div>
+        <footer class="source-line">
+          <strong>Repository evidence @ b403b0</strong>
+          <span><span class="mono">mux.ts</span> · <span class="mono">mux-adapters.ts</span> · <span class="mono">index.ts</span> · <span class="mono">session.ts</span> · <span class="mono">subagent-done.ts</span></span>
+        </footer>
+      </section>
+
+      <section class="slide" id="primitives" data-title="Primitives vs semantics" tabindex="-1" aria-labelledby="primitives-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Evidence ledger</p>
+            <h2 id="primitives-title">Upstream provides primitives—not Pi semantics.</h2>
+          </div>
+          <span class="slide-index">Platform / 03</span>
+        </header>
+        <div class="slide-content ledger">
+          <section class="ledger-column" aria-labelledby="provides-title">
+            <div class="ledger-head"><h3 id="provides-title">What Vercel already proves</h3><span class="badge badge--fact">Verified</span></div>
+            <ul class="ledger-list">
+              <li>Dedicated Firecracker microVM: private kernel, filesystem, processes and network namespace.</li>
+              <li>Named persistent Sandbox; each session is one VM boot. Stop preserves filesystem, not processes.</li>
+              <li>Supported interactive CLI path with raw stdin/stdout, resize, exit frame and timeout extension.</li>
+              <li>Command and file APIs, names, stop/resume and snapshots.</li>
+              <li>Official Herdr precedent: one local pane to one persistent named Sandbox.</li>
+            </ul>
+          </section>
+          <div class="ledger-seam" aria-hidden="true">semantic seam</div>
+          <section class="ledger-column ledger-column--missing" aria-labelledby="missing-title">
+            <div class="ledger-head"><h3 id="missing-title">What the integration must add</h3><span class="badge badge--proposal">Proposal</span></div>
+            <ul class="ledger-list">
+              <li>Immutable run ID, increasing generation and one-writer controller lease.</li>
+              <li>Durable event journal, parent delivery cursor and idempotent event IDs.</li>
+              <li>Question/steer inbox with tuple dedupe and terminal acknowledgement.</li>
+              <li>Current-generation transcript boundary and result extraction.</li>
+              <li>Remote loadout proof, process-group kill proof and recovery reconciliation.</li>
+            </ul>
+          </section>
+          <div class="protocol-warning"><span class="badge badge--gate">Gate</span><span>Direct WebSocket reimplementation is blocked for the PoC. Pinned source is implementation evidence—not a public framing guarantee. Use the supported CLI subprocess.</span></div>
+        </div>
+        <footer class="source-line">
+          <strong>Sources</strong>
+          <a href="https://vercel.com/docs/sandbox/concepts#isolation-architecture">Isolation architecture</a>
+          <a href="https://vercel.com/docs/sandbox/concepts/persistent-sandboxes#sandboxes-and-sessions">Persistence model</a>
+          <a href="https://vercel.com/docs/sandbox/sdk-reference">SDK reference</a>
+          <a href="https://vercel.com/docs/sandbox/ecosystem/herdr#custom-agents">Custom agents</a>
+        </footer>
+      </section>
+
+      <section class="slide" id="architecture" data-title="Recommended architecture" tabindex="-1" aria-labelledby="architecture-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Recommended topology</p>
+            <h2 id="architecture-title">One pane. Two channels. One authority.</h2>
+          </div>
+          <span class="slide-index">Architecture / 04</span>
+        </header>
+        <figure class="slide-content architecture architecture-wrap" data-mode="all" aria-labelledby="architecture-title architecture-caption">
+          <div class="path-controls" role="group" aria-label="Highlight an architecture channel">
+            <span class="label">Trace channel</span>
+            <button class="path-button" type="button" data-path="all" aria-pressed="true">Both</button>
+            <button class="path-button" type="button" data-path="pty" aria-pressed="false">Human PTY</button>
+            <button class="path-button" type="button" data-path="control" aria-pressed="false">Durable control</button>
+          </div>
+          <div class="arch-stage">
+            <svg viewBox="0 0 1180 390" role="img" aria-labelledby="arch-svg-title arch-svg-desc" preserveAspectRatio="xMidYMid meet">
+              <title id="arch-svg-title">Local Herdr surface connected to a Vercel Sandbox through separate terminal and durable control channels</title>
+              <desc id="arch-svg-desc">Human keystrokes travel from the local Herdr pane through the pinned vercel sandbox exec interactive CLI to remote tmux and the native Pi TUI. Separately, the local controller sends generation-scoped commands to a durable inbox and receives acknowledgements and events from the trusted remote runner and session journal. Controller commands never travel through terminal bytes.</desc>
+              <defs>
+                <marker id="arrow-pty" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
+                  <path d="M0,0 L8,4 L0,8 Z" fill="var(--transport)"></path>
+                </marker>
+                <marker id="arrow-control" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
+                  <path d="M0,0 L8,4 L0,8 Z" fill="var(--control)"></path>
+                </marker>
+              </defs>
+
+              <rect class="boundary" x="18" y="30" width="375" height="330"></rect>
+              <text class="svg-boundary" x="34" y="51">LOCAL CONTROL + PRESENTATION</text>
+              <rect class="boundary-seam" x="414" y="30" width="225" height="330"></rect>
+              <text class="svg-boundary" x="430" y="51">SUPPORTED TRANSPORT BOUNDARY</text>
+              <rect class="boundary" x="660" y="30" width="500" height="330"></rect>
+              <text class="svg-boundary" x="676" y="51">VERCEL SANDBOX / REMOTE TRUST BOUNDARY</text>
+
+              <g class="pty-path">
+                <path class="pty-line" d="M38 131 H85 M245 131 H438 M615 131 H694 M842 131 H936" marker-end="url(#arrow-pty)"></path>
+                <text class="svg-small" x="38" y="111">HUMAN KEYS</text>
+                <text class="svg-small" x="270" y="118">RAW PTY · RESIZE · EXIT</text>
+                <text class="svg-small" x="722" y="118">DETACH / REATTACH</text>
+              </g>
+
+              <path class="node-terminal" d="M85 84 H245 V180 H85 Z"></path>
+              <path d="M85 103 H245" stroke="var(--signal)" stroke-width="1"></path>
+              <circle cx="99" cy="94" r="3" fill="var(--signal)"></circle>
+              <text class="svg-label svg-terminal" x="105" y="131">Herdr pane</text>
+              <text class="svg-small svg-terminal" x="105" y="151">LOCAL SURFACE</text>
+
+              <path class="node" d="M438 84 H596 L615 103 V180 H438 Z"></path>
+              <text class="svg-label" x="463" y="124">Pinned Vercel CLI</text>
+              <text class="svg-small" x="463" y="146">sandbox exec --interactive</text>
+              <text class="svg-small" x="463" y="162">SUPPORTED FOR PoC</text>
+
+              <path class="node" d="M694 84 H842 V180 H694 Z"></path>
+              <text class="svg-label" x="715" y="126">Remote tmux / PTY</text>
+              <text class="svg-small" x="715" y="148">BRIDGE-LOSS BUFFER</text>
+
+              <path class="node-terminal" d="M936 84 H1128 V180 H936 Z"></path>
+              <text class="svg-label svg-terminal" x="958" y="126">Native Pi TUI</text>
+              <text class="svg-small svg-terminal" x="958" y="148">NO-SUDO PI USER</text>
+
+              <path class="node" d="M63 231 H333 L354 252 V335 H63 Z"></path>
+              <text class="svg-label" x="85" y="270">Local VercelController</text>
+              <text class="svg-small" x="85" y="292">CREDENTIALS · MAPPING · CURSOR</text>
+              <text class="svg-small" x="85" y="308">CLEANUP · BUDGET · RECONCILE</text>
+
+              <path class="node" d="M438 231 H596 L615 250 V335 H438 Z"></path>
+              <text class="svg-label" x="463" y="270">Authenticated APIs</text>
+              <text class="svg-small" x="463" y="292">FILES / COMMAND CONTROL</text>
+              <text class="svg-small" x="463" y="308">NO PUBLIC PORT</text>
+
+              <path class="node-runner" d="M694 231 H842 V335 H694 Z"></path>
+              <text class="svg-label" x="715" y="270">Trusted runner</text>
+              <text class="svg-small" x="715" y="292">PGID · LEASE · VALIDATE</text>
+              <text class="svg-small" x="715" y="308">SEPARATE IDENTITY</text>
+
+              <path class="node-journal" d="M935 221 H1116 V325 H935 Z M944 231 H1125 V335 H944 Z"></path>
+              <text class="svg-label" x="968" y="260">Session journal</text>
+              <text class="svg-small" x="968" y="282">INBOX / ACKS / EVENTS</text>
+              <text class="svg-small" x="968" y="298">JSONL / LOADOUT / ARTIFACTS</text>
+
+              <g class="control-path">
+                <path class="control-line" d="M354 259 H438 M615 259 H694 M842 259 H935" marker-end="url(#arrow-control)"></path>
+                <path class="control-line" d="M944 317 H864 C851 317 850 332 833 332 H636 C620 332 620 317 605 317 H438 C419 317 419 316 402 316 H354" marker-end="url(#arrow-control)"></path>
+                <path class="control-line" d="M1030 221 V198 H1028 V180" marker-end="url(#arrow-control)"></path>
+                <text class="svg-small" x="363" y="247">COMMAND TUPLE</text>
+                <text class="svg-small" x="690" y="349">ACKS + EVENTS / DURABLE CURSOR</text>
+                <text class="svg-small" x="1037" y="207">DEDUPE / APPLY</text>
+              </g>
+            </svg>
+          </div>
+          <div class="arch-mobile" role="img" aria-label="Responsive architecture: separate human terminal and durable controller channels cross from the local Herdr surface into the Vercel Sandbox">
+            <section class="mobile-channel mobile-channel--pty pty-path">
+              <header class="mobile-channel-head"><span>Human PTY · presentation</span><span>best-effort / non-durable</span></header>
+              <ol class="mobile-flow">
+                <li><span class="mobile-boundary">Local surface</span><strong>Human keys → Herdr pane</strong></li>
+                <li><span class="mobile-boundary">Supported transport boundary</span><strong>Pinned <span class="mono">vercel sandbox exec --interactive</span></strong></li>
+                <li><span class="mobile-boundary">Vercel Sandbox</span><strong>Remote tmux / PTY → native Pi TUI</strong><span>No-sudo Pi user; detach/reattach buffer.</span></li>
+              </ol>
+            </section>
+            <section class="mobile-channel mobile-channel--control control-path">
+              <header class="mobile-channel-head"><span>Durable control · authority</span><span>deduped / acknowledged</span></header>
+              <ol class="mobile-flow">
+                <li><span class="mobile-boundary">Local control</span><strong>VercelController</strong><span>Credentials, mapping, cursor, cleanup and budget.</span></li>
+                <li><span class="mobile-boundary">Authenticated boundary</span><strong>File / command APIs · no public port</strong></li>
+                <li><span class="mobile-boundary">Trusted remote identity</span><strong>Runner → session journal ↔ Pi-side extension</strong><span>PGID, lease, inbox, acks, events, JSONL and loadout.</span></li>
+              </ol>
+            </section>
+          </div>
+          <figcaption class="path-notes" id="architecture-caption">
+            <p class="path-note path-note--pty"><span><strong>Human PTY:</strong>&nbsp;native interaction and presentation; best-effort, non-durable, never replayed automatically.</span></p>
+            <p class="path-note path-note--control"><span><strong>Durable control:</strong>&nbsp;the sole controller-to-Pi path; <span class="mono">(runId, generation, commandId)</span> inbox, persisted receipt, applied/rejected ack.</span></p>
+          </figcaption>
+        </figure>
+        <footer class="source-line">
+          <strong>Sources</strong>
+          <a href="https://vercel.com/docs/sandbox/ecosystem/herdr#how-it-works">Official bridge workflow</a>
+          <a href="https://github.com/vercel-labs/herdr-vercel-sandbox-plugin/blob/be8393aac17eae4b67ca58fdcc5ad8233f91b6c5/src/bridge.mjs#L207-L234">Pinned plugin bridge</a>
+          <a href="https://github.com/vercel/sandbox/blob/be86cc619390868ae08435fde227c6896b8acad9/packages/sandbox/src/interactive-shell/interactive-shell.ts#L141-L217">Interactive implementation evidence</a>
+        </footer>
+      </section>
+
+      <section class="slide" id="lifecycle" data-title="Control and lifecycle" tabindex="-1" aria-labelledby="lifecycle-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">State authority</p>
+            <h2 id="lifecycle-title">A stopped VM is interrupted—not completed.</h2>
+          </div>
+          <span class="slide-index">Lifecycle / 05</span>
+        </header>
+        <div class="slide-content lifecycle-layout">
+          <div>
+            <p class="scroll-hint" id="lifecycle-scroll-hint">Focus the state track and use ← / → to inspect every state.</p>
+            <div class="state-scroll" data-scroll-region tabindex="0" aria-label="Proposed lifecycle state machine. Use left and right arrow keys to scroll." aria-describedby="lifecycle-scroll-hint">
+              <div class="state-track">
+                <div class="state">reserved</div>
+                <div class="state">provisional</div>
+                <div class="state">creating</div>
+                <div class="state">preparing</div>
+                <div class="state">ready</div>
+                <div class="state state--active">running</div>
+                <div class="state state--active">waiting<br>answer / children / idle</div>
+                <div class="state state--terminal">completing</div>
+                <div class="state state--terminal">completed / stopped</div>
+              </div>
+            </div>
+            <div class="exception-track"><strong>Active exceptions</strong><span>interrupted</span><span>· missing</span><span>· failed</span><span>· kill-pending</span><span>· deleted</span><span class="operation-separation">stop is reversible · kill verifies death · delete is separately confirmed</span></div>
+          </div>
+          <div>
+            <div class="recovery-grid">
+              <article class="recovery-case"><span class="recovery-label">01 / Reattach</span><h3>Same VM session</h3><p>Pi still runs. Connect a replacement bridge to the existing remote tmux.</p></article>
+              <article class="recovery-case"><span class="recovery-label">02 / Recover</span><h3>New VM session</h3><p>Old processes are gone. Restore filesystem, verify loadout, increment generation; the controller authorizes one new JSONL writer.</p></article>
+              <article class="recovery-case"><span class="recovery-label">03 / Resume completed</span><h3>New autonomous run</h3><p>Only after proven completion and exact remote loadout validation.</p></article>
+            </div>
+            <div class="authority-rule"><span class="badge badge--proposal">Authority</span><span><strong>Completion</strong> = runner terminal event + valid current-generation transcript boundary.</span><span class="badge badge--gate">Never infer</span><span>Pane loss, socket loss, stop, timeout or stale <span class="mono">agent_end</span> cannot prove completion.</span></div>
+          </div>
+        </div>
+        <footer class="source-line">
+          <strong>Primary evidence</strong>
+          <a href="https://vercel.com/docs/sandbox/concepts/persistent-sandboxes">Persistent Sandboxes</a>
+          <a href="https://vercel.com/docs/sandbox/concepts/persistent-sandboxes#lifecycle-hooks">Lifecycle hooks</a>
+          <a href="https://raw.githubusercontent.com/herdrdev/herdr/v0.8.2/docs/next/website/src/content/docs/session-state.mdx">Herdr session restore semantics</a>
+        </footer>
+      </section>
+
+      <section class="slide" id="security" data-title="Security boundary" tabindex="-1" aria-labelledby="security-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Identity and trust</p>
+            <h2 id="security-title">Pi gets a private home—not the keys.</h2>
+          </div>
+          <span class="slide-index">Security / 06</span>
+        </header>
+        <div class="slide-content security-layout">
+          <div class="identity-stack" aria-label="Proposed separation of identities">
+            <div class="identity-layer"><span class="identity-name">Local host</span><div><strong>Vercel control identity</strong><p>Team/project auth stays local; mapping, resource policy and deletion remain host-controlled.</p></div></div>
+            <div class="identity-layer"><span class="identity-name">Trusted remote</span><div><strong>Privileged setup + runner</strong><p>Owns immutable control code, process groups, journal and narrow IPC.</p></div></div>
+            <div class="identity-layer"><span class="identity-name">Workload</span><div><strong>Dedicated Pi user · no sudo</strong><p>Private home and worktree; no admin grant, no effective capabilities, cannot modify runner/control code.</p></div></div>
+          </div>
+          <div class="security-checks">
+            <div class="fail-closed"><strong>Fail closed × 2</strong><p>Before every launch <em>and</em> after every resume: verify UID, groups, sudo denial, empty capabilities, ownership/modes and exact inbox/event/ack permissions.</p></div>
+            <div class="check-grid" aria-label="Additional security controls">
+              <div class="check-item">Reviewed upload manifest and digest; exclude Git, env, SSH/cloud credential and token-like paths.</div>
+              <div class="check-item">Deny-by-default egress with documented DNS/CIDR/SNI limits; never broaden automatically.</div>
+              <div class="check-item">No public control port; use authenticated Vercel control and interactive channels.</div>
+              <div class="check-item">Pin CLI/SDK, image, Pi, runner and extensions; resolve and hash remotely.</div>
+              <div class="check-item">Treat snapshots as sensitive when agent login persists; bound retention and delete explicitly.</div>
+              <div class="check-item">No host Git credentials by default; patch-check before apply; no automatic commit or push.</div>
+            </div>
+          </div>
+        </div>
+        <footer class="source-line">
+          <strong>Sources</strong>
+          <a href="https://vercel.com/docs/sandbox/concepts/multi-agent">Multi-user Sandboxes</a>
+          <a href="https://vercel.com/docs/sandbox/concepts/firewall">Firewall</a>
+          <a href="https://vercel.com/docs/sandbox/concepts/authentication">Authentication</a>
+          <a href="https://vercel.com/docs/sandbox/concepts/persistent-sandboxes#default-snapshot-expiration-and-retention">Snapshot retention</a>
+        </footer>
+      </section>
+
+      <section class="slide" id="scope" data-title="Compatibility and scope" tabindex="-1" aria-labelledby="scope-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Profile compatibility</p>
+            <h2 id="scope-title">The runner earns the semantics.</h2>
+          </div>
+          <span class="slide-index">Scope / 07</span>
+        </header>
+        <div class="slide-content">
+          <p class="scroll-hint" id="scope-table-hint">Focus the matrix and use ← / → to inspect every column.</p>
+          <div class="table-wrap" data-scroll-region tabindex="0" aria-label="Scrollable compatibility matrix. Use left and right arrow keys to scroll." aria-describedby="scope-table-hint">
+            <table class="compatibility-table">
+              <thead><tr><th>Behavior</th><th>Custom terminal profile</th><th>Recommended runner</th><th>MVP</th></tr></thead>
+              <tbody>
+                <tr><td>Native Pi TUI in Herdr</td><td>Yes</td><td>Yes</td><td>Required</td></tr>
+                <tr><td>Controller steering</td><td>Fragile terminal injection</td><td>Durable inbox + dedupe/ack; no PTY duplication</td><td>Required</td></tr>
+                <tr><td>Direct human typing</td><td>Yes</td><td>PTY-only, best-effort, non-durable</td><td>Required / separate</td></tr>
+                <tr><td>Question + current-run result</td><td>No</td><td>Event journal + JSONL boundary + terminal event</td><td>Required</td></tr>
+                <tr><td>Kill proves death</td><td>Unknown</td><td>PGID / remote tmux verification</td><td>Required</td></tr>
+                <tr><td>Parent / Herdr restart</td><td>Mapping + reconnect only</td><td>Locator + journal + generations</td><td>Required</td></tr>
+                <tr><td>Tool identity</td><td>No</td><td>Resolve and hash inside remote image</td><td>Required</td></tr>
+                <tr><td>Safe writeback</td><td>Git patch</td><td>Baseline/tag/binary patch + local apply check</td><td>Required for writers</td></tr>
+                <tr><td>Nested children</td><td>No</td><td>Future controller delegation</td><td>Deferred / reject</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="scope-band"><span class="badge badge--proposal">Initial scope</span><span><strong>One child per Sandbox:</strong> Linux-compatible, non-nesting, no host-only paths/sockets; read-mostly first.</span><span><strong>Explicit opt-in:</strong> keep <span class="mono">PI_SUBAGENT_MUX=herdr</span>; add a separate <span class="mono">execution-target=vercel</span>.</span></div>
+        </div>
+        <footer class="source-line">
+          <strong>Upstream boundary</strong>
+          <a href="https://vercel.com/docs/sandbox/ecosystem/herdr#custom-agents">Custom terminal agents are explicitly unverified; Pi is not built in</a>
+          <a href="https://vercel.com/docs/sandbox/ecosystem/herdr#herdr-was-detached-or-restarted">Explicit reconnect workflow</a>
+        </footer>
+      </section>
+
+      <section class="slide" id="poc" data-title="Phased proof of concept" tabindex="-1" aria-labelledby="poc-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Bounded proof of concept</p>
+            <h2 id="poc-title">Five stages. Every stage has a stop line.</h2>
+          </div>
+          <span class="slide-index">Plan / 08</span>
+        </header>
+        <div class="slide-content poc-layout">
+          <div class="stage-list" aria-label="Proof of concept stages and gates">
+            <article class="stage-row"><div class="stage-id"><strong>Stage 0</strong><span>1–2 eng-days</span></div><div class="stage-build"><strong>Contract seam · no cloud</strong><p>Fake <span class="mono">RunController</span>, registry migration, local behavior through the seam.</p></div><div class="stage-gate"><strong>Gate</strong><p>tmux/Herdr launch, question, result, resume and kill stay identical; feature off by default.</p></div></article>
+            <article class="stage-row"><div class="stage-id"><strong>Stage 1</strong><span>2–3 days</span></div><div class="stage-build"><strong>Interactive spike</strong><p>Pinned supported CLI; one fixture; typing, paste, Unicode, signals, resize, detach/restart.</p></div><div class="stage-gate"><strong>Gate</strong><p>No corruption, duplicate writer or false completion; semantic state without screen inference; no direct WS.</p></div></article>
+            <article class="stage-row"><div class="stage-id"><strong>Stage 2</strong><span>3–5 days</span></div><div class="stage-build"><strong>Lifecycle protocol</strong><p>Journal, inbox/acks, settlement, result/stats and process-group kill; crash every boundary.</p></div><div class="stage-gate"><strong>Gate</strong><p>Under retries: one notification per event ID, one apply per command tuple; no PTY duplication; kill proof.</p></div></article>
+            <article class="stage-row"><div class="stage-id"><strong>Stage 3</strong><span>3–5 days</span></div><div class="stage-build"><strong>Persistence + writeback</strong><p>Stop mid-turn, recover to new generation, completed resume, drift refusal and binary patch.</p></div><div class="stage-gate"><strong>Gate</strong><p>No stale result or duplicate writer; loadout fails closed; source changes only after patch check.</p></div></article>
+            <article class="stage-row"><div class="stage-id"><strong>Stage 4</strong><span>2–4 days</span></div><div class="stage-build"><strong>Security + cost</strong><p>No-sudo identity checks, fake secrets, egress, IPC, timeout, orphan, retention and deletion.</p></div><div class="stage-gate"><strong>Gate</strong><p>Security/product acceptance and no unresolved high-severity issue.</p></div></article>
+          </div>
+          <div class="effort-strip" aria-label="Planning effort bands"><strong>Planning estimates</strong><div class="effort-item"><strong>3–5 eng-days</strong><span>terminal/auth spike + protocol</span></div><div class="effort-item"><strong>3–6 eng-weeks</strong><span>selected non-nesting MVP</span></div><div class="effort-item"><strong>8–12+ eng-weeks total</strong><span>production hardening</span></div></div>
+        </div>
+        <footer class="source-line">
+          <strong>Proposal</strong>
+          <span>Estimates assume one experienced TypeScript/Node engineer plus security/product review; they are planning ranges, not commitments. PTY/process recovery has the largest variance.</span>
+        </footer>
+      </section>
+
+      <section class="slide" id="hard-stops" data-title="Hard stops" tabindex="-1" aria-labelledby="hard-stops-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Fail the PoC, do not weaken the contract</p>
+            <h2 id="hard-stops-title">Six reasons to stop and choose another path.</h2>
+          </div>
+          <span class="slide-index">Hard stops / 09</span>
+        </header>
+        <div class="slide-content stop-layout">
+          <div class="stop-grid" aria-label="Hard stop conditions">
+            <div class="stop-item">Reliable interaction/recovery requires copying an undocumented WebSocket protocol without a stable Vercel contract.</div>
+            <div class="stop-item">Disconnect leaves an unidentifiable Pi writer that cannot be safely reattached or killed.</div>
+            <div class="stop-item">The runner cannot distinguish VM interruption from Pi completion.</div>
+            <div class="stop-item">Remote loadout or session identity cannot be proven before resume.</div>
+            <div class="stop-item">Required authentication needs broad, long-lived host secrets and brokering is unworkable.</div>
+            <div class="stop-item">Required profiles depend on host sockets/paths—or nesting cannot be deferred.</div>
+          </div>
+          <div class="alternative-strip" aria-label="Fallback execution options">
+            <article class="alternative"><strong>Local Docker</strong><p>First choice if the goal is only “keep tools off the host”; shared files preserve current watcher assumptions.</p></article>
+            <article class="alternative"><strong>SSH host + Herdr</strong><p>Lower-complexity persistent remote path when hardened development VMs already exist.</p></article>
+            <article class="alternative"><strong>Vercel</strong><p>Choose only when managed microVM isolation, burst, disposability and egress controls justify protocol work and metering.</p></article>
+          </div>
+        </div>
+        <footer class="source-line">
+          <strong>Comparison sources</strong>
+          <a href="https://vercel.com/docs/sandbox/concepts#sandboxes-vs-containers">Sandbox vs container isolation</a>
+          <a href="https://raw.githubusercontent.com/herdrdev/herdr/v0.8.2/docs/next/website/src/content/docs/persistence-remote.mdx">Herdr SSH remote mode</a>
+          <a href="https://vercel.com/docs/sandbox/pricing">Vercel pricing and limits</a>
+        </footer>
+      </section>
+
+      <section class="slide" id="decisions" data-title="Owner decisions" tabindex="-1" aria-labelledby="decisions-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Before funding the build</p>
+            <h2 id="decisions-title">Ten owner decisions define the PoC envelope.</h2>
+          </div>
+          <span class="slide-index">Decisions / 10</span>
+        </header>
+        <div class="slide-content decision-grid" aria-label="Product and implementation decisions">
+          <article class="decision-question"><div><strong>Eligible profiles</strong><p>Name them. Nested profiles are rejected for MVP; decide Claude, GUI/browser and host-integrated exclusions.</p></div></article>
+          <article class="decision-question"><div><strong>Spawn policy</strong><p>Explicit target, per-profile default or automatic? <span class="recommended">Explicit opt-in recommended.</span></p></div></article>
+          <article class="decision-question"><div><strong>Session authority</strong><p>Accept remote-canonical JSONL with a local mirror/locator, or require continuous local mirroring?</p></div></article>
+          <article class="decision-question"><div><strong>Writeback</strong><p><span class="recommended">Reviewed upload + explicit Git patch recommended;</span> remote Git credentials or another model?</p></div></article>
+          <article class="decision-question"><div><strong>Provider authentication</strong><p>Interactive login, short-lived injection or brokering—and may login persist in snapshots?</p></div></article>
+          <article class="decision-question"><div><strong>Network policy</strong><p>Exact allowed domains/tools; default-deny; temporary preparation egress?</p></div></article>
+          <article class="decision-question"><div><strong>Interruption policy</strong><p>Stop on inactivity + explicit recover, or automatic recover? Set timeout and max task length.</p></div></article>
+          <article class="decision-question"><div><strong>Retention + cleanup</strong><p>Snapshot count/TTL, transcript retention, deletion confirmation and named orphan owner.</p></div></article>
+          <article class="decision-question"><div><strong>Plan + residency + budget</strong><p>Vercel plan, region/data residency, concurrency and daily spend cap.</p></div></article>
+          <article class="decision-question"><div><strong>Fallback</strong><p>If recovery is unreliable, choose Docker or SSH rather than weakening completion/kill guarantees.</p></div></article>
+        </div>
+        <footer class="source-line">
+          <strong>Decision principle</strong>
+          <span>The PoC is not approved by a successful terminal demo; it is approved by explicit scope, ownership and passed semantic gates.</span>
+        </footer>
+      </section>
+
+      <section class="slide slide--final" id="recommendation" data-title="Final recommendation" tabindex="-1" aria-labelledby="recommendation-title">
+        <header class="slide-head">
+          <div class="slide-head-copy">
+            <p class="eyebrow">Final recommendation</p>
+          </div>
+          <span class="slide-index">Authorize / 11</span>
+        </header>
+        <div class="slide-content final-layout">
+          <div class="final-argument">
+            <h2 id="recommendation-title">Fund the staged PoC only.</h2>
+            <p class="lede">Keep Herdr as the surface. Add Vercel as an execution target. Use the pinned supported interactive CLI. Make the runner journal and Pi-side inbox/ack protocol authoritative.</p>
+            <div class="promotion-line"><span class="badge badge--gate">Promote only if</span><span>interruption vs completion, process kill proof, single-writer recovery, event replay, remote loadout identity, secret-safe auth and exact cleanup all pass.</span></div>
+          </div>
+          <aside class="final-side" aria-label="Recommended proof of concept envelope and outcomes">
+            <div class="envelope">
+              <div class="envelope-row"><strong>Profile</strong><span>One non-nesting, read-mostly, Linux-compatible child</span></div>
+              <div class="envelope-row"><strong>Transport</strong><span>Pinned <span class="mono">vercel sandbox exec --interactive</span>; no direct WebSocket client</span></div>
+              <div class="envelope-row"><strong>Security</strong><span>Distinct no-sudo Pi user, short sessions, no public ports</span></div>
+              <div class="envelope-row"><strong>Authority</strong><span>Remote journal + generation-scoped durable inbox/acks</span></div>
+            </div>
+            <div class="fork-outcome"><div><strong>If gates pass</strong><span>Opt-in Vercel target for selected children.</span></div><div><strong>If gates fail</strong><span>Docker for lower effort; SSH for persistent remote simplicity.</span></div></div>
+            <div class="key-sources">
+              <strong>Primary source set</strong>
+              <nav aria-label="Primary source links">
+                <a href="https://vercel.com/docs/sandbox">Sandbox overview</a>
+                <a href="https://vercel.com/docs/sandbox/concepts/persistent-sandboxes">Persistence</a>
+                <a href="https://vercel.com/docs/sandbox/ecosystem/herdr">Herdr integration</a>
+                <a href="https://vercel.com/docs/sandbox/concepts/firewall">Firewall</a>
+                <a href="https://vercel.com/docs/sandbox/concepts/authentication">Authentication</a>
+                <a href="https://vercel.com/docs/sandbox/pricing">Pricing + limits</a>
+                <a href="https://github.com/vercel/sandbox/tree/be86cc619390868ae08435fde227c6896b8acad9">Pinned Sandbox source</a>
+                <a href="https://github.com/vercel-labs/herdr-vercel-sandbox-plugin/tree/be8393aac17eae4b67ca58fdcc5ad8233f91b6c5">Pinned Herdr plugin</a>
+              </nav>
+            </div>
+          </aside>
+        </div>
+        <footer class="source-line">
+          <strong>Remaining gates</strong>
+          <span>CLI signal/disconnect behavior · same-session tmux reattach · Pi JSONL recovery boundaries · provider auth under narrow egress · snapshot compliance · profile-by-profile cost and compatibility.</span>
+        </footer>
+      </section>
+    </main>
+
+    <nav class="deck-nav" aria-label="Slide navigation">
+      <button class="nav-button" id="prev-slide" type="button" disabled>← Prev</button>
+      <div class="nav-status" id="nav-status"><strong>Decision</strong><span> · arrows / space / page keys</span></div>
+      <button class="nav-button" id="next-slide" type="button">Next →</button>
+    </nav>
+  </div>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var deck = document.getElementById("deck");
+      var slides = Array.prototype.slice.call(deck.querySelectorAll(".slide"));
+      var previousButton = document.getElementById("prev-slide");
+      var nextButton = document.getElementById("next-slide");
+      var progress = document.getElementById("deck-progress");
+      var count = document.getElementById("slide-count");
+      var status = document.getElementById("nav-status");
+      var themeButton = document.getElementById("theme-toggle");
+      var presentationQuery = window.matchMedia("(min-width: 980px) and (min-height: 720px)");
+      var reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+      var darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+      var currentIndex = 0;
+      var observer = null;
+      var observerLocked = false;
+      var observerUnlockTimer = null;
+
+      function lockObserver(duration) {
+        observerLocked = true;
+        window.clearTimeout(observerUnlockTimer);
+        observerUnlockTimer = window.setTimeout(function () {
+          observerLocked = false;
+        }, duration);
+      }
+
+      function twoDigits(value) {
+        return String(value).padStart(2, "0");
+      }
+
+      function indexFromHash() {
+        var id = decodeURIComponent(window.location.hash.replace(/^#/, ""));
+        var found = slides.findIndex(function (slide) { return slide.id === id; });
+        return found >= 0 ? found : 0;
+      }
+
+      function replaceHash(id) {
+        var nextHash = "#" + encodeURIComponent(id);
+        if (window.location.hash === nextHash) return;
+        try {
+          window.history.replaceState(null, "", nextHash);
+        } catch (error) {
+          window.location.hash = nextHash;
+        }
+      }
+
+      function updateChrome(updateHash) {
+        var slide = slides[currentIndex];
+        progress.value = currentIndex + 1;
+        progress.textContent = "Slide " + (currentIndex + 1) + " of " + slides.length;
+        count.textContent = twoDigits(currentIndex + 1) + " / " + twoDigits(slides.length);
+        status.innerHTML = "<strong>" + slide.dataset.title + "</strong><span> · arrows / space / page keys</span>";
+        previousButton.disabled = currentIndex === 0;
+        nextButton.disabled = currentIndex === slides.length - 1;
+        if (updateHash) replaceHash(slide.id);
+      }
+
+      function applyMode() {
+        var presenting = presentationQuery.matches;
+        deck.classList.toggle("reading-mode", !presenting);
+        slides.forEach(function (slide, index) {
+          slide.classList.toggle("is-active", index === currentIndex);
+          if (presenting) {
+            slide.setAttribute("aria-hidden", index === currentIndex ? "false" : "true");
+          } else {
+            slide.removeAttribute("aria-hidden");
+          }
+        });
+        updateChrome(false);
+      }
+
+      function showSlide(index, options) {
+        var settings = options || {};
+        var bounded = Math.max(0, Math.min(slides.length - 1, index));
+        if (bounded === currentIndex && !settings.force) return;
+        currentIndex = bounded;
+        applyMode();
+        updateChrome(settings.updateHash !== false);
+        if (presentationQuery.matches) {
+          if (settings.focus !== false) slides[currentIndex].focus({ preventScroll: true });
+        } else if (settings.scroll !== false) {
+          lockObserver(reducedMotionQuery.matches ? 80 : 500);
+          slides[currentIndex].scrollIntoView({
+            behavior: reducedMotionQuery.matches ? "auto" : "smooth",
+            block: "start"
+          });
+        }
+      }
+
+      function setupObserver() {
+        if (observer) observer.disconnect();
+        if (!("IntersectionObserver" in window)) return;
+        observer = new IntersectionObserver(function (entries) {
+          if (presentationQuery.matches || observerLocked) return;
+          var visible = entries.filter(function (entry) { return entry.isIntersecting; })
+            .sort(function (a, b) { return b.intersectionRatio - a.intersectionRatio; });
+          if (!visible.length) return;
+          var nextIndex = slides.indexOf(visible[0].target);
+          if (nextIndex >= 0 && nextIndex !== currentIndex) {
+            currentIndex = nextIndex;
+            slides.forEach(function (slide, index) {
+              slide.classList.toggle("is-active", index === currentIndex);
+            });
+            updateChrome(true);
+          }
+        }, { threshold: [0.35, 0.55, 0.75] });
+        slides.forEach(function (slide) { observer.observe(slide); });
+      }
+
+      previousButton.addEventListener("click", function () { showSlide(currentIndex - 1); });
+      nextButton.addEventListener("click", function () { showSlide(currentIndex + 1); });
+
+      document.addEventListener("keydown", function (event) {
+        var target = event.target;
+        if (target && target.closest("button, a, input, textarea, select, [contenteditable='true'], [data-scroll-region]")) return;
+        if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+        var handled = true;
+        switch (event.key) {
+          case "ArrowRight":
+          case "ArrowDown":
+          case " ":
+          case "PageDown":
+            showSlide(currentIndex + 1);
+            break;
+          case "ArrowLeft":
+          case "ArrowUp":
+          case "PageUp":
+            showSlide(currentIndex - 1);
+            break;
+          case "Home":
+            showSlide(0);
+            break;
+          case "End":
+            showSlide(slides.length - 1);
+            break;
+          default:
+            handled = false;
+        }
+        if (handled) event.preventDefault();
+      });
+
+      window.addEventListener("hashchange", function () {
+        showSlide(indexFromHash(), { updateHash: false, force: true });
+      });
+
+      function onViewportModeChange() {
+        applyMode();
+        setupObserver();
+      }
+
+      if (presentationQuery.addEventListener) {
+        presentationQuery.addEventListener("change", onViewportModeChange);
+      } else {
+        presentationQuery.addListener(onViewportModeChange);
+      }
+
+      document.querySelectorAll(".architecture").forEach(function (figure) {
+        var buttons = figure.querySelectorAll("[data-path]");
+        buttons.forEach(function (button) {
+          button.addEventListener("click", function () {
+            figure.dataset.mode = button.dataset.path;
+            buttons.forEach(function (candidate) {
+              candidate.setAttribute("aria-pressed", candidate === button ? "true" : "false");
+            });
+          });
+        });
+      });
+
+      var themeStorageKey = "vercel-herdr-deck-theme";
+      var themeStates = ["auto", "light", "dark"];
+
+      function readThemeState() {
+        try {
+          var saved = window.localStorage.getItem(themeStorageKey);
+          return themeStates.indexOf(saved) >= 0 ? saved : "auto";
+        } catch (error) {
+          return "auto";
+        }
+      }
+
+      function persistThemeState() {
+        try {
+          window.localStorage.setItem(themeStorageKey, themeState);
+        } catch (error) {
+          // Theme still applies for this page view when persistent storage is unavailable.
+        }
+      }
+
+      var themeState = readThemeState();
+
+      function applyThemeState(shouldPersist) {
+        if (themeState === "auto") {
+          document.documentElement.removeAttribute("data-theme");
+        } else {
+          document.documentElement.setAttribute("data-theme", themeState);
+        }
+        if (shouldPersist) persistThemeState();
+      }
+
+      function updateThemeLabel() {
+        var label = themeState.charAt(0).toUpperCase() + themeState.slice(1);
+        themeButton.textContent = "Theme · " + label;
+        themeButton.dataset.shortLabel = label;
+        themeButton.setAttribute("aria-label", "Theme: " + label.toLowerCase() + ". Activate to cycle Auto, Light and Dark.");
+      }
+
+      themeButton.addEventListener("click", function () {
+        themeState = themeStates[(themeStates.indexOf(themeState) + 1) % themeStates.length];
+        applyThemeState(true);
+        updateThemeLabel();
+      });
+
+      applyThemeState(false);
+      var initialIndex = indexFromHash();
+      currentIndex = initialIndex;
+      applyMode();
+      if (window.location.hash && !presentationQuery.matches) lockObserver(800);
+      setupObserver();
+      updateThemeLabel();
+      if (window.location.hash && !presentationQuery.matches) {
+        window.requestAnimationFrame(function () {
+          window.requestAnimationFrame(function () {
+            slides[initialIndex].scrollIntoView({ behavior: "auto", block: "start" });
+          });
+        });
+      } else if (presentationQuery.matches) {
+        slides[currentIndex].focus({ preventScroll: true });
+      }
+    }());
+  </script>
+</body>
+</html>
