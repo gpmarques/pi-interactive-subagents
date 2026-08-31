@@ -43,7 +43,9 @@ The parent registers exactly five lifecycle tools:
 | `subagent_kill` | Terminate a running child by exact name and forget its resumable mapping |
 | `subagents_list` | List available agent definitions |
 
-Pi-backed sub-agent sessions may additionally receive the child-only `ask_question` tool to ask the orchestrator one question and wait for the reply. There is also a `/subagent <agent> <task>` command for spawning directly.
+Pi-backed sub-agent sessions may additionally receive the child-only `ask_question` tool to ask the orchestrator one question and wait for the reply. Spawning also requires the parent to have a persistent session file: use Pi's normal session mode, not `--no-session`. A sessionless parent receives `Error: no session file. Start pi with a persistent session to use subagents.`
+
+`/subagent <agent> <task>` is a convenience command, not a direct spawn primitive. It validates the agent name and queues a user instruction telling the current parent model to call `subagent`; the child is created only if that model turn invokes the tool.
 
 ### Spawning
 
@@ -120,7 +122,7 @@ name: my-agent
 description: Does something specific
 model: openai-codex/gpt-5.6-sol
 thinking: medium
-tools: read, edit, write, safe_bash, web_search
+tools: read, edit, write, safe_bash
 session-mode: lineage-only
 auto-exit: true
 ---
@@ -135,8 +137,8 @@ You are a specialized agent that does X...
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
-| `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed for Pi: `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `thinking` | string | Pi 0.84.4 levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Pi clamps the request to levels supported by the selected model/provider, so the effective level can differ |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed for Pi: `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing listed tools are loaded explicitly |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the lifecycle/spawning toolset** (`subagent`, `subagent_message`, `subagent_resume`, `subagent_kill`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn or use lifecycle tools |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -170,11 +172,13 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-**Pi-backed profiles are whitelist-only.** They launch with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only extensions backing listed tools are loaded explicitly. Omitted `tools` yields only `ask_question`, not Pi's ambient defaults. This restriction survives resume through the validated loadout record.
+**Pi-backed profiles are whitelist-only.** They launch with `--no-extensions` (ambient extension discovery disabled) and `--tools <allowlist>`; only the exact extensions backing listed custom tools are re-enabled with explicit `-e` paths. Omitted `tools` yields only `ask_question`, not Pi's ambient defaults. A child's cwd or effective agent directory can affect explicit backing-extension resolution, but it never grants ambient extensions. This restriction survives resume through the validated loadout record.
 
-The bundled profile configuration grants the four web tools only to `researcher`; no other bundled profile requests them. They all resolve to one canonical extension entrypoint from the effective child agent directory's `<agent-dir>/npm/node_modules/pi-web-access/package.json` (`pi.extensions`). Resolution requires exactly one unfiltered string `"npm:pi-web-access"` in that agent directory's `settings.json`, verifies exactly `pi-web-access@0.27.0`, and requires all four canonical tools to remain enabled and unrenamed in `web-search.json`. Package roots, manifests, entrypoints, settings, and config must remain canonical and inside their allowed roots; symlinks at those checked paths are rejected. A stale package beside Pi's installation is not a fallback, and unrelated global packages are never scanned.
+`safe_bash` is one such explicitly loaded custom tool. It checks a fixed denylist of dangerous command patterns and then delegates to Pi's ordinary bash implementation; it is not an OS sandbox and does not protect the separate built-in `bash` tool. Ambient/global extensions such as a `bash-guard` are disabled by `--no-extensions` and are **not inherited** by restricted children. A profile that declares `bash` therefore receives ordinary Pi bash unless another explicitly backed custom tool is declared instead.
 
-Metadata validation alone does not authorize a researcher launch. Before any researcher surface is created, the extension starts the canonical Pi executable in the exact child cwd and effective agent directory with `--mode rpc --offline --no-session --no-extensions`, the exact four-tool `--tools` allowlist, the validated package entrypoint, and a private no-tool inspector. It issues only RPC `get_state`, then requires Pi's fresh active-tool set to equal the four canonical names. The process is capped at 5 seconds in a detached process group; the group is killed with `SIGKILL` during cleanup and its nonce-bound temporary snapshot is removed in `finally`. No persistent session or prompt is created, and no model/provider or web call is made. Missing/partial/renamed registration, extension errors, malformed or uninspectable RPC state, timeout, or nonzero exit fails closed with repair guidance before surface or loadout creation. On the current verified installation the isolated preflight measured about 0.25–0.30 seconds.
+Among the bundled profiles, only `researcher` declares the four canonical web tools—`web_search`, `fetch_content`, `get_search_content`, and `source_check`—and it uses `safe_bash` rather than built-in `bash`. The web tools all resolve to one canonical extension entrypoint from the effective child agent directory's `<agent-dir>/npm/node_modules/pi-web-access/package.json` (`pi.extensions`). Resolution requires exactly one unfiltered string `"npm:pi-web-access"` in that agent directory's `settings.json`, verifies exactly `pi-web-access@0.27.0`, and requires all four canonical tools to remain enabled and unrenamed in `web-search.json`. Package roots, manifests, entrypoints, settings, and config must remain canonical and inside their allowed roots; symlinks at those checked paths are rejected. A stale package beside Pi's installation is not a fallback, and unrelated global packages are never scanned.
+
+Metadata validation alone does not authorize a researcher launch. Before any researcher surface is created, the extension starts the canonical Pi executable in the exact child cwd and effective agent directory with `--mode rpc --offline --no-session --no-extensions`, the exact four-tool `--tools` allowlist, the validated package entrypoint, and a private no-tool inspector. It issues only RPC `get_state`, then requires Pi's fresh active-tool set to equal the four canonical names. The process is capped at 5 seconds in a detached process group; the group is killed with `SIGKILL` during cleanup and its nonce-bound temporary snapshot is removed in `finally`. No persistent session or prompt is created, and no model/provider or web call is made. Missing/partial/renamed registration, extension errors, malformed or uninspectable RPC state, timeout, or nonzero exit fails closed with repair guidance before surface or loadout creation.
 
 Ambient loading remains disabled for the real child: the validated entrypoint is passed once with `-e` while the complete child `--tools` allowlist selects the web tools plus `safe_bash` and ordinary `ask_question`. After a successful initial preflight, the launch records the canonical entrypoint digest, package root/name/version and manifest digest, and full/relevant config identity. Resume verifies those fields before the probe and again afterward. Recorded drift rejects before a surface; same-version unrecorded helper/dependency drift is not claimed to be detected.
 
@@ -186,7 +190,7 @@ Extensions can register additional Pi-backed tools at runtime via `registerToolE
 
 ## Role folders
 
-`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (CLAUDE.md, skills, extensions) apply:
+`cwd` starts a sub-agent in a role directory. If `<cwd>/.pi/agent` exists, it becomes that child's effective Pi agent directory for explicit configuration and backing-tool resolution. Restricted Pi children still use `--no-extensions`, so merely changing cwd never ambient-loads extensions from that directory:
 
 ```
 project/
@@ -215,12 +219,53 @@ Status display is configured via `config.json` in the extension directory (copy 
 
 ## Requirements and setup
 
-- [pi](https://github.com/earendil-works/pi-mono)
+- [Earendil Pi 0.84.4](https://github.com/earendil-works/pi-mono). This audit checked 0.84.4's package, persistent-session, and thinking interfaces and exercised offline child tool surfaces with that CLI. The repository's locked development libraries remain 0.84.3, and no provider-backed lifecycle run was repeated for this documentation update. Compatibility with other Pi versions is not asserted here.
 - Either Herdr or [tmux](https://github.com/tmux/tmux)
 - `agent-browser` on `PATH` when using the bundled `visual-tester`. The agent reports a blocked run if it is missing; it never installs a browser tool or uses a fallback.
 - [`pi-web-access`](https://github.com/nicobailon/pi-web-access) when using the bundled `researcher`. Install it separately with `pi install npm:pi-web-access`; this project does not vendor it.
 
-Start Pi inside either supported backend:
+### Install this fork
+
+Pi packages execute code with full user privileges. Review the source, then install the maintained fork at the reviewed commit used by this documentation. This fork is not published in the npm registry, so do **not** use `pi install npm:pi-interactive-subagents`.
+
+```bash
+# User scope (~/.pi/agent/settings.json)
+pi install git:github.com/gpmarques/pi-interactive-subagents@b403b02484aa545b72a0a852aee9ecce524fa6f8
+
+# Or project scope (.pi/settings.json); run from the project root
+pi install git:github.com/gpmarques/pi-interactive-subagents@b403b02484aa545b72a0a852aee9ecce524fa6f8 -l
+```
+
+A reviewed local checkout is also supported. Local paths are referenced in place rather than copied:
+
+```bash
+git clone https://github.com/gpmarques/pi-interactive-subagents.git
+cd pi-interactive-subagents
+git checkout b403b02484aa545b72a0a852aee9ecce524fa6f8
+FORK_CHECKOUT=$PWD
+pi install "$FORK_CHECKOUT"                  # user scope
+# cd /path/to/project
+# pi install "$FORK_CHECKOUT" -l             # project scope
+```
+
+`pi update --extensions` reconciles installed packages, but a commit-pinned git source stays on its configured commit. The targeted form below does the same for this package. Update has no `-l` mode: it considers configured user packages and trusted project packages. To advance this package, review a new commit and replace the pin explicitly; use `-l` when replacing a project-local source:
+
+```bash
+pi update --extension git:github.com/gpmarques/pi-interactive-subagents
+
+NEW_COMMIT=replace-with-a-reviewed-full-commit
+pi install "git:github.com/gpmarques/pi-interactive-subagents@$NEW_COMMIT"
+# pi install "git:github.com/gpmarques/pi-interactive-subagents@$NEW_COMMIT" -l
+```
+
+Remove the package from the same scope in which it was installed:
+
+```bash
+pi remove git:github.com/gpmarques/pi-interactive-subagents       # user scope
+pi remove git:github.com/gpmarques/pi-interactive-subagents -l    # project scope
+```
+
+Start Pi with its normal persistent session inside either supported backend. Do not pass `--no-session` when the parent must spawn children:
 
 ```bash
 # Herdr: start Herdr, then run `pi` in its terminal
@@ -261,7 +306,7 @@ The broader profile check starts a fresh offline Pi RPC runtime for every bundle
 npm run test:integration:web-tools
 ```
 
-The dedicated Herdr lifecycle smoke uses real `openai-codex/gpt-5.6-sol` calls. It intentionally covers only the public completion/result-follow-up/explicit-resume and kill/forget/resume-refusal paths. Cleanup checks exact focus, pane IDs, and tab IDs without closing unknown resources:
+The dedicated Herdr lifecycle smoke uses real `openai-codex/gpt-5.6-sol` calls. It intentionally covers only the public completion/result-follow-up/explicit-resume and kill/forget/resume-refusal paths. Cleanup checks exact focus, pane IDs, and tab IDs without closing unknown resources. This is an opt-in provider/live-surface command and was **not** run in the current documentation audit:
 
 ```bash
 env -u PI_SUBAGENT_LIFECYCLE_DISABLED PI_SUBAGENT_MUX=herdr PI_TEST_MODEL=openai-codex/gpt-5.6-sol PI_TEST_TIMEOUT=180000 npm run test:integration:lifecycle-smoke
@@ -273,15 +318,15 @@ To launch Pi manually against the working-tree extension rather than an installe
 cd "$(git rev-parse --show-toplevel)" && PI_SUBAGENT_MUX=herdr pi -ne -e "$PWD/pi-extension/subagents/index.ts"
 ```
 
-`$PWD` must be the repository root when Pi starts; the leading `cd` is therefore part of the command. The post-correction Stage 5 run passed 2/2 in 64.444s, persisted 15 Sol assistant responses (9 completion/resume and 6 kill/forget), and reported 0 provider errors. During that run, the harness compared exact focus and pane sets and restored `w7` to `focus=null` with panes `[w7:p1, w7:p33]`. Separate post-run inspection confirmed the sole tab `[w7:t1]` and found no owned recent files or processes. The shared snapshot was subsequently hardened to enforce exact tab equality; the provider suite was not rerun after this harness-only change. The production fix and corrected smoke harness were independently approved.
+`$PWD` must be the repository root when Pi starts; the leading `cd` is therefore part of the command. The historical post-correction Stage 5 run passed 2/2 in 64.444s, persisted 15 Sol assistant responses (9 completion/resume and 6 kill/forget), and reported 0 provider errors. During that run, the harness compared exact focus and pane sets and restored `w7` to `focus=null` with panes `[w7:p1, w7:p33]`. Separate post-run inspection confirmed the sole tab `[w7:t1]` and found no owned recent files or processes. The shared snapshot was subsequently hardened to enforce exact tab equality; the provider suite was not rerun after this harness-only change. The production fix and corrected smoke harness were independently approved.
 
-The Stage 6 broad provider-backed lifecycle suite is separate from both the no-model surface suites and the bounded Stage 5 smoke. It covers six current-contract cases: completion, a 90-second active call beyond the watchdog threshold, parallel fixed-profile children, fixed-profile fork context, `ask_question` plus exact-name `subagent_message`, and project-local profile discovery. Reproduce the post-correction forced-Herdr/Sol run from anywhere inside the repository with:
+The Stage 6 broad provider-backed lifecycle suite is separate from both the no-model surface suites and the bounded Stage 5 smoke. It is also opt-in and was not run in the current documentation audit. It covers six current-contract cases: completion, a 90-second active call beyond the watchdog threshold, parallel fixed-profile children, fixed-profile fork context, `ask_question` plus exact-name `subagent_message`, and project-local profile discovery. Reproduce the post-correction forced-Herdr/Sol run from anywhere inside the repository with:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)" && env -u PI_SUBAGENT_LIFECYCLE_DISABLED PI_SUBAGENT_MUX=herdr PI_TEST_MODEL=openai-codex/gpt-5.6-sol PI_TEST_TIMEOUT=120000 npm run test:integration:lifecycle
 ```
 
-The post-correction run passed 6/6 in 199.084s and persisted 40 assistant responses, all `openai-codex/gpt-5.6-sol`, with 0 provider errors and 0 test timeouts. During that run, the harness compared exact focus and pane sets and restored `w7` to `focus=null` with panes `[w7:p1, w7:p33]` after every case. Separate post-run inspection confirmed the sole tab `[w7:t1]` and found no owned recent files or processes. The shared snapshot was subsequently hardened to enforce exact tab equality; the provider suite was not rerun after this harness-only change. This is provider-backed Herdr evidence for those six cases, not model-backed tmux evidence or a generic production guarantee.
+The historical post-correction run passed 6/6 in 199.084s and persisted 40 assistant responses, all `openai-codex/gpt-5.6-sol`, with 0 provider errors and 0 test timeouts. During that run, the harness compared exact focus and pane sets and restored `w7` to `focus=null` with panes `[w7:p1, w7:p33]` after every case. Separate post-run inspection confirmed the sole tab `[w7:t1]` and found no owned recent files or processes. The shared snapshot was subsequently hardened to enforce exact tab equality; the provider suite was not rerun after this harness-only change. This is provider-backed Herdr evidence for those six cases, not model-backed tmux evidence or a generic production guarantee.
 
 ## Acknowledgements
 
