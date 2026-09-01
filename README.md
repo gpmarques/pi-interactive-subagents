@@ -176,7 +176,7 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 `safe_bash` is one such explicitly loaded custom tool. It checks a fixed denylist of dangerous command patterns and then delegates to Pi's ordinary bash implementation; it is not an OS sandbox and does not protect the separate built-in `bash` tool. Ambient/global extensions such as a `bash-guard` are disabled by `--no-extensions` and are **not inherited** by restricted children. A profile that declares `bash` therefore receives ordinary Pi bash unless another explicitly backed custom tool is declared instead.
 
-Among the bundled profiles, only `researcher` declares the four canonical web tools—`web_search`, `fetch_content`, `get_search_content`, and `source_check`—and it uses `safe_bash` rather than built-in `bash`. The web tools all resolve to one canonical extension entrypoint from the effective child agent directory's `<agent-dir>/npm/node_modules/pi-web-access/package.json` (`pi.extensions`). Resolution requires exactly one unfiltered string `"npm:pi-web-access"` in that agent directory's `settings.json`, verifies exactly `pi-web-access@0.27.0`, and requires all four canonical tools to remain enabled and unrenamed in `web-search.json`. Package roots, manifests, entrypoints, settings, and config must remain canonical and inside their allowed roots; symlinks at those checked paths are rejected. A stale package beside Pi's installation is not a fallback, and unrelated global packages are never scanned.
+Among the bundled profiles, only `researcher` declares the four canonical web tools—`web_search`, `fetch_content`, `get_search_content`, and `source_check`—and it uses `safe_bash` rather than built-in `bash`. The web tools all resolve to one canonical extension entrypoint from the effective child agent directory's `<agent-dir>/npm/node_modules/pi-web-access/package.json` (`pi.extensions`). Resolution requires exactly one unfiltered string `"npm:pi-web-access@0.27.0"` in that agent directory's `settings.json`, verifies that the installed manifest is also exactly `pi-web-access@0.27.0`, and requires all four canonical tools to remain enabled and unrenamed in `web-search.json`. An unpinned selector, another pin or range, an object/filter registration, a duplicate, or any second registration that could identify `pi-web-access` fails closed. Package roots, manifests, entrypoints, settings, and config must remain canonical and inside their allowed roots; symlinks at those checked paths are rejected. A stale package beside Pi's installation is not a fallback, and unrelated global packages are never scanned.
 
 Metadata validation alone does not authorize a researcher launch. Before any researcher surface is created, the extension starts the canonical Pi executable in the exact child cwd and effective agent directory with `--mode rpc --offline --no-session --no-extensions`, the exact four-tool `--tools` allowlist, the validated package entrypoint, and a private no-tool inspector. It issues only RPC `get_state`, then requires Pi's fresh active-tool set to equal the four canonical names. The process is capped at 5 seconds in a detached process group; the group is killed with `SIGKILL` during cleanup and its nonce-bound temporary snapshot is removed in `finally`. No persistent session or prompt is created, and no model/provider or web call is made. Missing/partial/renamed registration, extension errors, malformed or uninspectable RPC state, timeout, or nonzero exit fails closed with repair guidance before surface or loadout creation.
 
@@ -222,7 +222,174 @@ Status display is configured via `config.json` in the extension directory (copy 
 - [Earendil Pi 0.84.4](https://github.com/earendil-works/pi-mono). This audit checked 0.84.4's package, persistent-session, and thinking interfaces and exercised offline child tool surfaces with that CLI. The repository's locked development libraries remain 0.84.3, and no provider-backed lifecycle run was repeated for this documentation update. Compatibility with other Pi versions is not asserted here.
 - Either Herdr or [tmux](https://github.com/tmux/tmux)
 - `agent-browser` on `PATH` when using the bundled `visual-tester`. The agent reports a blocked run if it is missing; it never installs a browser tool or uses a fallback.
-- [`pi-web-access`](https://github.com/nicobailon/pi-web-access) when using the bundled `researcher`. Install it separately with `pi install npm:pi-web-access`; this project does not vendor it.
+- [`pi-web-access`](https://github.com/nicobailon/pi-web-access) when using the bundled `researcher`. This project does not vendor it; follow the backed-up exact-pin procedure below.
+
+The common migration target is the global Pi agent directory: the explicit `PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. There is one resolver-specific override: when an explicitly requested or profile-defined child cwd contains `<cwd>/.pi/agent`, that directory wins for that child and must independently contain both `<cwd>/.pi/agent/settings.json` with the exact selector and `<cwd>/.pi/agent/npm/node_modules/pi-web-access` with the pinned package. This custom nested `agent` directory is **not** Pi's standard project-local `-l` package scope: `-l` writes `<cwd>/.pi/settings.json` and `<cwd>/.pi/npm`, which this resolver does not read. Trusted standard project-scoped web-package semantics remain unsupported.
+
+For the currently verified lone global string registration, stop all parent/child Pi processes and migrate non-destructively in one maintenance window. The snippet initializes `EFFECTIVE_PI_AGENT_DIR` to the common global target; for a child that selects a custom `<cwd>/.pi/agent`, replace that assignment with the custom directory's absolute path and repeat the entire backup/install/verification procedure independently. Back up both the effective settings file and complete effective npm root before running `pi install`:
+
+```bash
+set -euo pipefail
+export EFFECTIVE_PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+STAMP=$(date +%Y%m%d-%H%M%S)
+export BACKUP="$EFFECTIVE_PI_AGENT_DIR/backups/pi-web-access-$STAMP"
+mkdir -p "$BACKUP"
+cp -p "$EFFECTIVE_PI_AGENT_DIR/settings.json" "$BACKUP/settings.json"
+cp -a "$EFFECTIVE_PI_AGENT_DIR/npm" "$BACKUP/npm"
+printf 'Backup: %s\n' "$BACKUP"
+
+PI_CODING_AGENT_DIR="$EFFECTIVE_PI_AGENT_DIR" pi install npm:pi-web-access@0.27.0
+
+node <<'NODE'
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const root = process.env.EFFECTIVE_PI_AGENT_DIR;
+const expected = "npm:pi-web-access@0.27.0";
+const settingsPath = path.join(root, "settings.json");
+const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+function identifiesPiWebAccess(source) {
+  if (source.startsWith("npm:")) return /^npm:pi-web-access(?:@|$)/.test(source);
+  const withoutRef = source.replace(/[?#].*$/, "").replace(/@[^/@]*$/, "");
+  const basename = withoutRef.replace(/[\\/]+$/, "").split(/[\\/:]/).at(-1)?.replace(/\.git$/, "");
+  if (basename === "pi-web-access") return true;
+  if (/^(?:git:|https?:|ssh:)/.test(source)) return false;
+  try {
+    const local = path.resolve(path.dirname(settingsPath), source);
+    const manifest = fs.statSync(local).isDirectory() ? path.join(local, "package.json") : local;
+    return JSON.parse(fs.readFileSync(manifest, "utf8")).name === "pi-web-access";
+  } catch { return false; }
+}
+const matches = (settings.packages ?? []).filter((entry) => {
+  const source = typeof entry === "string" ? entry : entry?.source;
+  return typeof source === "string" && identifiesPiWebAccess(source);
+});
+assert.equal(matches.length, 1, "expected one pi-web-access registration of any source type");
+assert.equal(matches[0], expected, "registration must be the exact unfiltered string pin");
+const manifest = JSON.parse(fs.readFileSync(
+  path.join(root, "npm/node_modules/pi-web-access/package.json"),
+  "utf8",
+));
+assert.equal(manifest.name, "pi-web-access");
+assert.equal(manifest.version, "0.27.0");
+console.log("verified exact selector and installed pi-web-access@0.27.0");
+NODE
+```
+
+That `pi install` replaces the current lone unpinned string by npm package identity without first uninstalling the working package. It is not a generic duplicate/object cleanup procedure: if the precondition is no longer one lone string registration, stop and review the settings rather than using destructive remove/install normalization. Unpinned, ranged, wrong-version, object/filter, duplicate, or ambiguous registrations remain fail-closed. Pi 0.84.4 skips exact npm pins during `pi update --extensions` and `pi update --all` (plain `pi update` updates Pi itself); no `pi update` form advances or repairs this pin.
+
+After verification, restart the parent Pi process and spawn a fresh researcher. Never resume an old child across this fork/package/config migration. Keep the printed backup path. To roll back both settings and installed npm state, stop Pi and use the safe staged restore below **only in the same maintenance window and only if no other package changes occurred**. Set `EFFECTIVE_PI_AGENT_DIR` to the directory that was migrated (the common global directory or a custom `<cwd>/.pi/agent`) and replace the placeholder with the concrete path printed during backup:
+
+```bash
+set -euo pipefail
+export EFFECTIVE_PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+BACKUP="$EFFECTIVE_PI_AGENT_DIR/backups/pi-web-access-YYYYMMDD-HHMMSS"
+case "$BACKUP" in
+  ""|*YYYYMMDD-HHMMSS*) echo "Set BACKUP to the concrete printed backup path" >&2; exit 1 ;;
+esac
+
+test -d "$EFFECTIVE_PI_AGENT_DIR"
+test -d "$BACKUP" && test ! -L "$BACKUP"
+EFFECTIVE_PI_AGENT_DIR=$(cd "$EFFECTIVE_PI_AGENT_DIR" && pwd -P)
+BACKUP=$(cd "$BACKUP" && pwd -P)
+case "$BACKUP/" in
+  "$EFFECTIVE_PI_AGENT_DIR/backups/"*) ;;
+  *) echo "BACKUP must be a concrete snapshot below $EFFECTIVE_PI_AGENT_DIR/backups" >&2; exit 1 ;;
+esac
+test -f "$BACKUP/settings.json" && test -r "$BACKUP/settings.json" && test ! -L "$BACKUP/settings.json"
+test -d "$BACKUP/npm" && test ! -L "$BACKUP/npm"
+
+audit_paths() {
+  SNAPSHOT_SETTINGS="$1" SNAPSHOT_NPM="$2" node <<'NODE'
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const settingsPath = process.env.SNAPSHOT_SETTINGS;
+const npmRoot = process.env.SNAPSHOT_NPM;
+const regular = (file) => fs.lstatSync(file).isFile() && !fs.lstatSync(file).isSymbolicLink();
+const directory = (dir) => fs.lstatSync(dir).isDirectory() && !fs.lstatSync(dir).isSymbolicLink();
+assert(regular(settingsPath), "settings.json must be a regular file");
+const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+assert(Array.isArray(settings.packages), "settings.json must contain a packages array");
+assert(directory(npmRoot), "complete npm backup directory is missing");
+assert(regular(path.join(npmRoot, "package.json")), "npm/package.json is missing");
+assert(regular(path.join(npmRoot, "package-lock.json")), "npm/package-lock.json is missing");
+assert(directory(path.join(npmRoot, "node_modules")), "npm/node_modules is missing");
+const webRoot = path.join(npmRoot, "node_modules/pi-web-access");
+const webManifest = path.join(webRoot, "package.json");
+assert(directory(webRoot), "pi-web-access package directory is missing");
+assert(regular(webManifest), "pi-web-access package manifest is missing");
+const web = JSON.parse(fs.readFileSync(webManifest, "utf8"));
+assert.equal(web.name, "pi-web-access");
+assert.equal(web.version, "0.27.0");
+NODE
+}
+
+audit_paths "$BACKUP/settings.json" "$BACKUP/npm"
+RESTORE_ID="$(date +%Y%m%d-%H%M%S)-$$"
+STAGE_SETTINGS="$EFFECTIVE_PI_AGENT_DIR/.settings.restore-$RESTORE_ID"
+STAGE_NPM="$EFFECTIVE_PI_AGENT_DIR/.npm.restore-$RESTORE_ID"
+OLD_SETTINGS="$EFFECTIVE_PI_AGENT_DIR/.settings.before-restore-$RESTORE_ID"
+OLD_NPM="$EFFECTIVE_PI_AGENT_DIR/.npm.before-restore-$RESTORE_ID"
+FAILED_SETTINGS="$EFFECTIVE_PI_AGENT_DIR/.settings.failed-restore-$RESTORE_ID"
+FAILED_NPM="$EFFECTIVE_PI_AGENT_DIR/.npm.failed-restore-$RESTORE_ID"
+for path in "$STAGE_SETTINGS" "$STAGE_NPM" "$OLD_SETTINGS" "$OLD_NPM" "$FAILED_SETTINGS" "$FAILED_NPM"; do
+  test ! -e "$path"
+done
+
+# These copies stage the complete restore on the live targets' filesystem.
+cp -p "$BACKUP/settings.json" "$STAGE_SETTINGS"
+cp -a "$BACKUP/npm" "$STAGE_NPM"
+audit_paths "$STAGE_SETTINGS" "$STAGE_NPM"
+
+test -f "$EFFECTIVE_PI_AGENT_DIR/settings.json" && test ! -L "$EFFECTIVE_PI_AGENT_DIR/settings.json"
+test -d "$EFFECTIVE_PI_AGENT_DIR/npm" && test ! -L "$EFFECTIVE_PI_AGENT_DIR/npm"
+rollback_activation() {
+  reason="$1"
+  set +e
+  test ! -e "$EFFECTIVE_PI_AGENT_DIR/settings.json" || mv "$EFFECTIVE_PI_AGENT_DIR/settings.json" "$FAILED_SETTINGS"
+  failed_settings_status=$?
+  test ! -e "$EFFECTIVE_PI_AGENT_DIR/npm" || mv "$EFFECTIVE_PI_AGENT_DIR/npm" "$FAILED_NPM"
+  failed_npm_status=$?
+  mv "$OLD_SETTINGS" "$EFFECTIVE_PI_AGENT_DIR/settings.json"
+  old_settings_status=$?
+  mv "$OLD_NPM" "$EFFECTIVE_PI_AGENT_DIR/npm"
+  old_npm_status=$?
+  set -e
+  if (( failed_settings_status || failed_npm_status || old_settings_status || old_npm_status )); then
+    echo "CRITICAL: restore activation failed and automatic rollback was incomplete: $reason" >&2
+  else
+    echo "Restore rejected; original working state was put back: $reason" >&2
+  fi
+  return 1
+}
+
+# Pi is stopped; each same-filesystem mv is an atomic rename.
+mv "$EFFECTIVE_PI_AGENT_DIR/settings.json" "$OLD_SETTINGS"
+if ! mv "$EFFECTIVE_PI_AGENT_DIR/npm" "$OLD_NPM"; then
+  if ! mv "$OLD_SETTINGS" "$EFFECTIVE_PI_AGENT_DIR/settings.json"; then
+    echo "CRITICAL: live npm could not be moved and settings rollback also failed" >&2
+  fi
+  echo "Could not move live npm aside; restore was not activated" >&2
+  exit 1
+fi
+if ! mv "$STAGE_SETTINGS" "$EFFECTIVE_PI_AGENT_DIR/settings.json"; then
+  rollback_activation "settings activation failed" || exit 1
+fi
+if ! mv "$STAGE_NPM" "$EFFECTIVE_PI_AGENT_DIR/npm"; then
+  rollback_activation "npm activation failed" || exit 1
+fi
+if ! audit_paths "$EFFECTIVE_PI_AGENT_DIR/settings.json" "$EFFECTIVE_PI_AGENT_DIR/npm"; then
+  rollback_activation "restored-state verification failed" || exit 1
+fi
+
+printf 'Restore verified. Previous settings: %s\nPrevious npm: %s\n' "$OLD_SETTINGS" "$OLD_NPM"
+# Optional only after reviewing the verified restore and the paths printed above:
+# rm -f -- "$OLD_SETTINGS"
+# rm -rf -- "$OLD_NPM"
+```
+
+The live npm root is never deleted before the backup and staged copy pass validation. Failed activation or restored-state verification moves the attempted restore aside and renames the original working state back into place. A later rollback would overwrite unrelated settings or package changes; take a new backup instead.
 
 ### Install this fork
 
@@ -230,10 +397,10 @@ Pi packages execute code with full user privileges. Review the source, then inst
 
 ```bash
 # User scope (~/.pi/agent/settings.json)
-pi install git:github.com/gpmarques/pi-interactive-subagents@b403b02484aa545b72a0a852aee9ecce524fa6f8
+pi install git:github.com/gpmarques/pi-interactive-subagents@eef62f9672b1e8fac4cf4ffff499ba304f0ce79f
 
 # Or project scope (.pi/settings.json); run from the project root
-pi install git:github.com/gpmarques/pi-interactive-subagents@b403b02484aa545b72a0a852aee9ecce524fa6f8 -l
+pi install git:github.com/gpmarques/pi-interactive-subagents@eef62f9672b1e8fac4cf4ffff499ba304f0ce79f -l
 ```
 
 A reviewed local checkout is also supported. Local paths are referenced in place rather than copied:
@@ -241,14 +408,32 @@ A reviewed local checkout is also supported. Local paths are referenced in place
 ```bash
 git clone https://github.com/gpmarques/pi-interactive-subagents.git
 cd pi-interactive-subagents
-git checkout b403b02484aa545b72a0a852aee9ecce524fa6f8
+git checkout eef62f9672b1e8fac4cf4ffff499ba304f0ce79f
 FORK_CHECKOUT=$PWD
 pi install "$FORK_CHECKOUT"                  # user scope
 # cd /path/to/project
 # pi install "$FORK_CHECKOUT" -l             # project scope
 ```
 
-`pi update --extensions` reconciles installed packages, but a commit-pinned git source stays on its configured commit. The targeted form below does the same for this package. Update has no `-l` mode: it considers configured user packages and trusted project packages. To advance this package, review a new commit and replace the pin explicitly; use `-l` when replacing a project-local source:
+Switching an existing user-level local-path registration to the reviewed git commit is a separate package-source migration; it is not part of web-access selector normalization. Stop Pi, enter the existing checkout so `FORK_CHECKOUT` identifies the registered local source, and take a separate timestamped snapshot of the effective settings and npm root. Local and git sources have different identities, so remove the old local registration before installing the commit pin:
+
+```bash
+set -euo pipefail
+cd /path/to/existing/pi-interactive-subagents
+FORK_CHECKOUT=$(pwd -P)
+export EFFECTIVE_PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+STAMP=$(date +%Y%m%d-%H%M%S)
+export BACKUP="$EFFECTIVE_PI_AGENT_DIR/backups/interactive-subagents-source-$STAMP"
+mkdir -p "$BACKUP"
+cp -p "$EFFECTIVE_PI_AGENT_DIR/settings.json" "$BACKUP/settings.json"
+cp -a "$EFFECTIVE_PI_AGENT_DIR/npm" "$BACKUP/npm"
+printf 'Backup: %s\n' "$BACKUP"
+
+pi remove "$FORK_CHECKOUT"
+pi install git:github.com/gpmarques/pi-interactive-subagents@eef62f9672b1e8fac4cf4ffff499ba304f0ce79f
+```
+
+If this source migration must be rolled back, stop Pi and use the complete safe staged restore procedure above with the concrete `interactive-subagents-source-<timestamp>` backup path instead of the web-access backup path. The snapshot restores both package registrations and installed npm state, so do **not** run a preliminary `pi remove`; the local checkout was referenced in place and was not deleted. The procedure validates and stages the complete snapshot, atomically renames the current files aside, verifies activation, and puts the pre-rollback state back if activation or verification fails. Use it only in the same maintenance window with no unrelated settings/package changes, then restart Pi. `pi update --extensions` reconciles installed packages, but a commit-pinned git source stays on its configured commit. The targeted form below does the same for this package. Update has no `-l` mode: it considers configured user packages and trusted project packages. To advance this package, review a new commit and replace the pin explicitly; use `-l` when replacing a project-local source:
 
 ```bash
 pi update --extension git:github.com/gpmarques/pi-interactive-subagents
@@ -294,7 +479,7 @@ PI_SUBAGENT_MUX=herdr npm run test:integration:surface
 PI_SUBAGENT_MUX=tmux npm run test:integration:surface
 ```
 
-The web-tool capability checks make no model or web calls. The production-boundary hermetic test proves that exact-name/version packages registering zero, partial, renamed, or all four tools cannot create a researcher surface unless the fresh capability probe succeeds; it also covers malformed output, extension errors, nonzero exit, timeout bounds, and temporary cleanup:
+The web-tool capability checks make no model or web calls. Unit regressions use isolated `PI_CODING_AGENT_DIR` and package roots to prove pinned-good behavior and rejection of unpinned, wrong-pin/range, installed-version mismatch, duplicate, filtered, and ambiguous registrations. The production-boundary hermetic test proves that exact-name/version packages registering zero, partial, renamed, or all four tools cannot create a researcher surface unless the fresh capability probe succeeds; it also covers malformed output, extension errors, nonzero exit, timeout bounds, and temporary cleanup:
 
 ```bash
 env -u PI_SUBAGENT_LIFECYCLE_DISABLED npm run test:web-preflight-hermetic
