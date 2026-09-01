@@ -81,12 +81,15 @@ import {
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const PI_WEB_ACCESS_PREFLIGHT_INSPECTOR = join(SUBAGENTS_DIR, "pi-web-access-preflight.ts");
 
-// Survive /reload: clear timers and abort poll loops from the previous module load.
-// /reload re-imports this file, giving fresh module-level state, but closures from
-// the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
+// Survive /reload: clear timers from the previous module load. Poll loops are
+// quiesced and awaited by session_shutdown before ownership is handed off; a
+// top-level abort here would race that handoff and close live child surfaces.
+// See https://github.com/HazAT/pi-interactive-subagents/issues/5
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const RUNNING_HANDOFF_KEY = Symbol.for("pi-subagents/running-handoff");
+const RUNNING_HANDOFF_VERSION = 1;
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -100,8 +103,9 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  if (!prevAbort || prevAbort.signal.aborted) {
+    (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  }
 }
 
 function getModuleAbortSignal(): AbortSignal {
@@ -1066,6 +1070,12 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  /** Settles only after the watcher's delivery continuation has finished. */
+  watcherContinuation?: Promise<void>;
+  /** Suppress cleanup and delivery while ownership moves to a reloaded module. */
+  reloadQuiescing?: boolean;
+  /** Naturally completed result awaiting delivery by the reloaded module. */
+  reloadPendingResult?: SubagentResult;
   /** Artifact directory containing this caller's persistent name registry. */
   registryArtifactDir: string;
   /** Set before termination so the watcher cannot deliver a stale result. */
@@ -1792,7 +1802,7 @@ function handleSubagentSteer(
 type TerminateSurface = (surface: string) => void;
 
 function shouldSuppressWatcherMessage(running: RunningSubagent): boolean {
-  return running.killed === true;
+  return running.killed === true || running.reloadQuiescing === true;
 }
 
 // Compatibility cleanup for stale files created by older child extensions.
@@ -2317,59 +2327,7 @@ async function resumeRegisteredSubagent(
 
     startWidgetRefresh();
     startStatusRefresh(pi);
-    const watcherAbort = new AbortController();
-    running.abortController = watcherAbort;
-
-    watchSubagent(running, watcherAbort.signal)
-      .then((result) => {
-        if (result.terminalProof !== "unproven") {
-          try {
-            markNameRunCompleted(artifactDir, sessionPath, id);
-          } catch {
-            // Delivery remains valid, but the persisted running proof is retained
-            // so a later cross-process resume fails closed.
-          }
-        }
-        if (shouldSuppressWatcherMessage(running)) return;
-        updateWidget();
-        const presentation = resolveResultPresentation(
-          { ...result, sessionFile: sessionPath, sessionId: resumedSessionId },
-          name,
-        );
-        pi.sendMessage(
-          {
-            customType: "subagent_result",
-            content: presentation,
-            display: true,
-            details: {
-              name,
-              task: message,
-              agent: running.agent,
-              exitCode: result.exitCode,
-              elapsed: result.elapsed,
-              sessionFile: sessionPath,
-              sessionId: resumedSessionId,
-              ...(result.error ? { error: result.error } : {}),
-              ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-              ...(result.stats ? { stats: result.stats } : {}),
-            },
-          },
-          SUBAGENT_RESULT_DELIVERY_OPTIONS,
-        );
-      })
-      .catch((error) => {
-        if (shouldSuppressWatcherMessage(running)) return;
-        updateWidget();
-        pi.sendMessage(
-          {
-            customType: "subagent_result",
-            content: `Resume error: ${error?.message ?? String(error)}`,
-            display: true,
-            details: { name, error: error?.message },
-          },
-          SUBAGENT_RESULT_DELIVERY_OPTIONS,
-        );
-      });
+    attachWatcher(running, pi);
 
     return {
       content: [{ type: "text" as const, text: `Completed subagent "${name}" resumed safely.` }],
@@ -3187,6 +3145,18 @@ async function watchSubagent(
       terminalProof: "natural",
     };
   } catch (err: any) {
+    if (running.reloadQuiescing) {
+      return {
+        name,
+        task,
+        summary: "Subagent watcher quiesced for extension reload.",
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: "reload",
+        sessionFile,
+        terminalProof: "unproven",
+      };
+    }
     discardLegacyQuestionArtifacts(running.sessionFile);
     discardSettledRecords(running.sessionFile);
     let terminationConfirmed = running.killed === true;
@@ -3232,6 +3202,128 @@ async function watchSubagent(
   }
 }
 
+function deliverWatcherResult(
+  running: RunningSubagent,
+  pi: ExtensionAPI,
+  result: SubagentResult,
+): void {
+  if (result.terminalProof !== "unproven") {
+    try {
+      markNameRunCompleted(
+        running.registryArtifactDir,
+        running.sessionFile,
+        running.id,
+      );
+    } catch {
+      // Keep fail-closed persisted running state if completion proof cannot
+      // be written; result delivery itself remains valid.
+    }
+  }
+  if (shouldSuppressWatcherMessage(running)) return;
+  updateWidget();
+
+  pi.sendMessage(
+    {
+      customType: "subagent_result",
+      content: resolveResultPresentation(result, running.name),
+      display: true,
+      details: {
+        name: running.name,
+        task: running.task,
+        agent: running.agent,
+        exitCode: result.exitCode,
+        elapsed: result.elapsed,
+        sessionFile: result.sessionFile,
+        ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+        ...(result.error ? { error: result.error } : {}),
+        ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+        ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+        ...(result.stats ? { stats: result.stats } : {}),
+      },
+    },
+    SUBAGENT_RESULT_DELIVERY_OPTIONS,
+  );
+}
+
+function deliverWatcherError(
+  running: RunningSubagent,
+  pi: ExtensionAPI,
+  error: any,
+): void {
+  if (shouldSuppressWatcherMessage(running)) return;
+  updateWidget();
+  pi.sendMessage(
+    {
+      customType: "subagent_result",
+      content: `Sub-agent "${running.name}" error: ${error?.message ?? String(error)}`,
+      display: true,
+      details: {
+        name: running.name,
+        task: running.task,
+        error: error?.message,
+      },
+    },
+    SUBAGENT_RESULT_DELIVERY_OPTIONS,
+  );
+}
+
+function attachWatcher(running: RunningSubagent, pi: ExtensionAPI): void {
+  running.reloadQuiescing = false;
+
+  let continuation: Promise<void>;
+  const pendingResult = running.reloadPendingResult;
+  if (pendingResult) {
+    running.reloadPendingResult = undefined;
+    continuation = Promise.resolve()
+      .then(() => {
+        if (runningSubagents.get(running.id) === running) {
+          runningSubagents.delete(running.id);
+        }
+        deliverWatcherResult(running, pi, pendingResult);
+      })
+      .catch((error) => deliverWatcherError(running, pi, error))
+      .finally(() => {
+        if (running.watcherContinuation === continuation) {
+          running.watcherContinuation = undefined;
+        }
+      });
+    running.watcherContinuation = continuation;
+    return;
+  }
+
+  const watcherAbort = new AbortController();
+  running.abortController = watcherAbort;
+  continuation = watchSubagent(running, watcherAbort.signal)
+    .then((result) => {
+      if (running.reloadQuiescing) {
+        if (!running.killed && result.terminalProof !== "unproven") {
+          running.reloadPendingResult = result;
+          runningSubagents.set(running.id, running);
+        }
+        return;
+      }
+      deliverWatcherResult(running, pi, result);
+    })
+    .catch((error) => deliverWatcherError(running, pi, error))
+    .finally(() => {
+      if (running.watcherContinuation === continuation) {
+        running.watcherContinuation = undefined;
+      }
+    });
+  running.watcherContinuation = continuation;
+}
+
+function consumeRunningHandoff(): RunningSubagent[] {
+  const handoff = (globalThis as any)[RUNNING_HANDOFF_KEY] as
+    | { version?: unknown; records?: unknown }
+    | undefined;
+  delete (globalThis as any)[RUNNING_HANDOFF_KEY];
+  if (handoff?.version !== RUNNING_HANDOFF_VERSION || !Array.isArray(handoff.records)) {
+    return [];
+  }
+  return handoff.records as RunningSubagent[];
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Fail closed when a resume deliberately suppresses lifecycle capabilities.
   // `subagent-done.ts` is loaded separately, so ask_question remains available.
@@ -3239,7 +3331,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   latestPi = pi;
   // Capture the UI context for widget updates
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
@@ -3249,10 +3341,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
     }
+
+    if (event.reason === "reload") {
+      for (const running of consumeRunningHandoff()) {
+        running.abortController = undefined;
+        running.watcherContinuation = undefined;
+        runningSubagents.set(running.id, running);
+        attachWatcher(running, pi);
+      }
+      if (runningSubagents.size > 0) {
+        startWidgetRefresh();
+        startStatusRefresh(pi);
+      }
+    }
   });
 
-  // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  // Clean up on session shutdown. Reload is distinct: watcher continuations
+  // are quiesced before their live ownership records move to the next module.
+  pi.on("session_shutdown", async (event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -3263,7 +3369,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
+
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+    if (event.reason === "reload") {
+      latestCtx = null;
+      latestPi = null;
+      const quiescingRecords = Array.from(runningSubagents.values());
+      for (const running of quiescingRecords) running.reloadQuiescing = true;
+      moduleAbort?.abort();
+      for (const running of quiescingRecords) running.abortController?.abort();
+      await Promise.all(quiescingRecords.map((running) => running.watcherContinuation));
+
+      // Kill and natural-completion continuations can change authoritative
+      // ownership while the blocked watchers settle. Publish only the records
+      // still owned now; never resurrect the pre-await snapshot.
+      const records = Array.from(runningSubagents.values()).filter(
+        (running) => !running.killed,
+      );
+      for (const running of records) {
+        running.abortController = undefined;
+        running.watcherContinuation = undefined;
+      }
+      (globalThis as any)[RUNNING_HANDOFF_KEY] = {
+        version: RUNNING_HANDOFF_VERSION,
+        records,
+      };
+      runningSubagents.clear();
+      return;
+    }
+
     if (moduleAbort) moduleAbort.abort();
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
@@ -3413,66 +3547,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           releaseSpawnName(reservation);
         }
 
-        // Create a separate AbortController for the watcher
-        // (the tool's signal completes when we return)
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-
         // Start widget refresh and status supervision when the first agent launches
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            if (result.terminalProof !== "unproven") {
-              try {
-                markNameRunCompleted(parentArtifactDir, running.sessionFile, running.id);
-              } catch {
-                // Keep fail-closed persisted running state if completion proof
-                // cannot be written; result delivery itself remains valid.
-              }
-            }
-            if (shouldSuppressWatcherMessage(running)) return;
-            updateWidget(); // reflect removal from Map immediately
-
-            const presentation = resolveResultPresentation(result, running.name);
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  ...(result.sessionId ? { sessionId: result.sessionId } : {}),
-                  ...(result.error ? { error: result.error } : {}),
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-                  ...(result.stats ? { stats: result.stats } : {}),
-                },
-              },
-              SUBAGENT_RESULT_DELIVERY_OPTIONS,
-            );
-          })
-          .catch((err) => {
-            if (shouldSuppressWatcherMessage(running)) return;
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
-              },
-              SUBAGENT_RESULT_DELIVERY_OPTIONS,
-            );
-          });
+        // Fire-and-forget: start watching in background. The continuation is
+        // retained so reload can quiesce it before rebinding to the new API.
+        attachWatcher(running, pi);
 
         // Return immediately, exposing the final deduplicated name rather than
         // the caller's possibly-colliding request.
