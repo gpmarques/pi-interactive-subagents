@@ -216,7 +216,7 @@ function fakeExtensionIdentities(paths: string[]) {
   }));
 }
 
-function writePiSettings(agentDir: string, packages: unknown[] = ["npm:pi-web-access"]): void {
+function writePiSettings(agentDir: string, packages: unknown[] = ["npm:pi-web-access@0.27.0"]): void {
   mkdirSync(agentDir, { recursive: true });
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages }));
 }
@@ -1761,13 +1761,13 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("resolves and deduplicates all four web tools through pi-web-access's manifest", () => {
+  it("resolves all four web tools from the exact pinned pi-web-access selector", () => {
     withTempDir((dir) => {
       const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
       const previousPackageDir = process.env.PI_PACKAGE_DIR;
       const agentDir = join(dir, "agent");
       const packageRoot = join(agentDir, "npm", "node_modules", "pi-web-access");
-      writePiSettings(agentDir);
+      writePiSettings(agentDir, ["npm:pi-web-access@0.27.0"]);
       const entrypoint = writePiWebAccessPackage(packageRoot, {
         entrypoint: "./runtime/nonstandard-entry.ts",
       });
@@ -1842,7 +1842,7 @@ describe("subagent discovery", () => {
       try {
         assert.throws(
           () => testApi.getToolExtensionPath("web_search"),
-          /unavailable under Pi's effective npm root.*pi install npm:pi-web-access.*fresh subagent/i,
+          /unavailable under Pi's effective npm root.*pi install npm:pi-web-access@0\.27\.0.*fresh subagent/i,
         );
 
         writePiWebAccessPackage(packageRoot, { name: "unrelated-package" });
@@ -1890,37 +1890,54 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("requires the exact unfiltered effective npm selector and rejects incompatible versions/config", () => {
+  it("rejects missing, unpinned, wrong-pin, duplicate, filtered, and ambiguous selectors", () => {
     withTempDir((dir) => {
       const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
       const agentDir = join(dir, "agent");
       const packageRoot = join(agentDir, "npm", "node_modules", "pi-web-access");
       process.env.PI_CODING_AGENT_DIR = agentDir;
       try {
-        writePiSettings(agentDir, []);
         writePiWebAccessPackage(packageRoot);
-        assert.throws(
-          () => testApi.resolvePiWebAccessExtension(),
-          /register exactly one unfiltered string.*npm:pi-web-access/i,
-        );
-
         const localAlternative = join(dir, "local-web-package");
         writePiWebAccessPackage(localAlternative);
-        for (const packages of [
-          ["npm:pi-web-access@0.27.0"],
-          [{ source: "npm:pi-web-access" }],
-          ["git:github.com/example/pi-web-access"],
-          ["../pi-web-access"],
-          ["npm:pi-web-access", "git:https://github.com/example/pi-web-access.git#main"],
-          ["npm:pi-web-access", "../local-web-package"],
-        ]) {
+        const rejectedSelectors: Array<[string, unknown[]]> = [
+          ["missing", []],
+          ["unpinned", ["npm:pi-web-access"]],
+          ["wrong exact pin", ["npm:pi-web-access@0.26.0"]],
+          ["version range", ["npm:pi-web-access@^0.27.0"]],
+          ["filtered pinned", [{ source: "npm:pi-web-access@0.27.0" }]],
+          ["filtered unpinned", [{ source: "npm:pi-web-access" }]],
+          ["duplicate pinned", ["npm:pi-web-access@0.27.0", "npm:pi-web-access@0.27.0"]],
+          ["pinned plus unpinned", ["npm:pi-web-access@0.27.0", "npm:pi-web-access"]],
+          ["git alternative", ["git:github.com/example/pi-web-access"]],
+          ["local alternative", ["../pi-web-access"]],
+          [
+            "pinned plus git alternative",
+            ["npm:pi-web-access@0.27.0", "git:https://github.com/example/pi-web-access.git#main"],
+          ],
+          ["pinned plus local alternative", ["npm:pi-web-access@0.27.0", "../local-web-package"]],
+        ];
+        for (const [label, packages] of rejectedSelectors) {
           writePiSettings(agentDir, packages);
           assert.throws(
             () => testApi.resolvePiWebAccessExtension(),
-            /register exactly one unfiltered string.*npm:pi-web-access/i,
+            /register exactly one unfiltered string.*npm:pi-web-access@0\.27\.0/i,
+            label,
           );
         }
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousConfigDir);
+      }
+    });
+  });
 
+  it("rejects package-version mismatch and incompatible pi-web-access config", () => {
+    withTempDir((dir) => {
+      const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+      const agentDir = join(dir, "agent");
+      const packageRoot = join(agentDir, "npm", "node_modules", "pi-web-access");
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
         writePiSettings(agentDir);
         writePiWebAccessPackage(packageRoot, { version: "0.10.7" });
         assert.throws(

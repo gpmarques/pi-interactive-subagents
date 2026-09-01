@@ -191,8 +191,8 @@ function getAgentConfigDir(): string {
 }
 
 const PI_WEB_ACCESS_PACKAGE = "pi-web-access";
-const PI_WEB_ACCESS_SOURCE = "npm:pi-web-access" as const;
 const SUPPORTED_PI_WEB_ACCESS_VERSION = "0.27.0";
+const PI_WEB_ACCESS_SOURCE = `npm:${PI_WEB_ACCESS_PACKAGE}@${SUPPORTED_PI_WEB_ACCESS_VERSION}` as const;
 const PI_WEB_ACCESS_TOOL_NAMES = {
   webSearch: "web_search",
   fetchContent: "fetch_content",
@@ -272,9 +272,8 @@ function sourceLooksLikePiWebAccess(source: string, settingsDir: string): boolea
 function piWebAccessError(reason: string): Error {
   return new Error(
     `Cannot provide pi-web-access tools: ${reason}. ` +
-      `Register and install exactly \`${PI_WEB_ACCESS_SOURCE}\` with ` +
-      `\`pi install ${PI_WEB_ACCESS_SOURCE}\`, or repair it with ` +
-      `\`pi update ${PI_WEB_ACCESS_SOURCE}\`, then start a fresh subagent; ` +
+      `Register, install, or repair exactly \`${PI_WEB_ACCESS_SOURCE}\` with ` +
+      `\`pi install ${PI_WEB_ACCESS_SOURCE}\`, then start a fresh subagent; ` +
       "saved loadouts keep immutable canonical entrypoint, package/version/manifest, and full-config identity.",
   );
 }

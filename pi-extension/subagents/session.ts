@@ -96,7 +96,7 @@ export function seedSubagentSessionFile(params: {
  * deleted.
  */
 export interface PiWebAccessPackageIdentity {
-  source: "npm:pi-web-access";
+  source: "npm:pi-web-access@0.27.0";
   packageRoot: string;
   packageName: "pi-web-access";
   packageVersion: string;
@@ -243,7 +243,7 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
       const validPiWebAccessIdentity = (value: unknown): value is PiWebAccessPackageIdentity => {
         if (!value || typeof value !== "object" || Array.isArray(value)) return false;
         const identity = value as Record<string, unknown>;
-        return identity.source === "npm:pi-web-access" &&
+        return identity.source === "npm:pi-web-access@0.27.0" &&
           identity.packageName === "pi-web-access" &&
           typeof identity.packageVersion === "string" &&
           identity.packageVersion.trim() !== "" &&

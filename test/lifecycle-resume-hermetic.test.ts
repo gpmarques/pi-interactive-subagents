@@ -130,7 +130,10 @@ describe("hermetic safe subagent resume", () => {
     const config = join(agentDir, "web-search.json");
     rmSync(packageRoot, { recursive: true, force: true });
     mkdirSync(packageRoot, { recursive: true });
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:pi-web-access"] }));
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: ["npm:pi-web-access@0.27.0"] }),
+    );
     writeFileSync(entrypoint, [
       "const names = [\"web_search\", \"fetch_content\", \"get_search_content\", \"source_check\"];",
       "export default function (pi) {",

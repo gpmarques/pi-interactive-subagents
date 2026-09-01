@@ -83,7 +83,10 @@ describe("production researcher capability preflight", { timeout: 30_000 }, () =
     const binDir = join(root, "bin");
     mkdirSync(packageRoot, { recursive: true });
     mkdirSync(binDir, { recursive: true });
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:pi-web-access"] }));
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: ["npm:pi-web-access@0.27.0"] }),
+    );
     writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
       name: "pi-web-access",
       version: "0.27.0",
